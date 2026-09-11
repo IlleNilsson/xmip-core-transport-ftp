@@ -30,10 +30,12 @@ use std::time::Duration;
 pub use client::{Client, Login};
 pub use reply::Reply;
 pub use session::{Event, Session};
-use transport::error::Result;
+use transport::error::{Result, protocol_error};
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, NoNativeClaim, ResourceClaim, Transport};
 
+#[derive(Clone)]
 pub struct FtpTransport {
     server: String,
     login: Login,
@@ -142,12 +144,99 @@ impl Transport for FtpTransport {
     }
 }
 
+impl FtpTransport {
+    /// Both ends on this machine: an ephemeral local port, an anonymous
+    /// login, the loopback timeout on every read.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self::new("127.0.0.1:0").timing_out_after(LOOPBACK_TIMEOUT)
+    }
+}
+
+/// A bound listener waiting for the one client that stores one file.
+struct Listening {
+    transport: FtpTransport,
+    listener: TcpListener,
+    address: String,
+}
+
+impl FarEnd for Listening {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        let mut session = self.transport.accept_one(&self.listener)?;
+        let arrived = session
+            .next_store()?
+            .ok_or_else(|| protocol_error("the client quit without storing"))?;
+        // Serve the QUIT that follows, so the client's goodbye is answered
+        // rather than met by a closed socket.
+        session.next_store()?;
+        Ok(arrived)
+    }
+}
+
+impl Loopback for FtpTransport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let (listener, address) = self.bind()?;
+        Ok(Box::new(Listening {
+            transport: self.clone(),
+            listener,
+            address,
+        }))
+    }
+
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        Self::new(address)
+            .timing_out_after(LOOPBACK_TIMEOUT)
+            .send("probe.bin", payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    fn edges() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+        ]
+    }
+
+    #[test]
+    fn the_loopback_stores_one_file_and_takes_it() {
+        let arrived = FtpTransport::loopback().round(b"UNA:+.? '").expect("round");
+        assert_eq!(arrived.bytes, b"UNA:+.? '");
+        assert!(arrived.origin_uri.starts_with("ftp://127.0.0.1:"));
+        assert!(arrived.origin_uri.ends_with("/probe.bin"));
+        let long = vec![0x2a; 100_000];
+        assert_eq!(
+            FtpTransport::loopback().round(&long).expect("long").bytes,
+            long
+        );
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edge_payloads_whole() {
+        let transport = FtpTransport::loopback();
+        assert!(transport.ceiling().is_none());
+        for (name, bytes) in edges() {
+            assert!(transport.refuses(&bytes).is_none(), "{name}");
+            let arrived = transport
+                .round(&bytes)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(arrived.bytes, bytes, "{name}");
+        }
     }
 
     #[test]
