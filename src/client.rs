@@ -160,13 +160,9 @@ impl Client {
         if reply.code != 227 {
             return Err(refused("passive mode", &reply));
         }
-        let data = TcpStream::connect(reply.passive_address()?)
-            .map_err(|e| classify("opening the data connection", &e))?;
-        if let Some(timeout) = self.timeout {
-            data.set_read_timeout(Some(timeout))
-                .map_err(|e| classify("setting the data timeout", &e))?;
-        }
-        Ok(data)
+        // The connect is bounded as well as the reads. It was bare until
+        // 2026-09-21, and a machine out of ephemeral ports waited without end.
+        socket::connect_tcp(&reply.passive_address()?, self.timeout)
     }
 
     fn completion(&mut self, what: &str) -> Result<()> {

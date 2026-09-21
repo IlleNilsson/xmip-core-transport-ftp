@@ -159,14 +159,10 @@ impl Session {
             .passive
             .take()
             .ok_or_else(|| protocol_error("a transfer without PASV first"))?;
-        let (stream, _) = listener
-            .accept()
-            .map_err(|e| classify("accepting the data connection", &e))?;
-        if let Some(timeout) = self.timeout {
-            stream
-                .set_read_timeout(Some(timeout))
-                .map_err(|e| classify("setting the data timeout", &e))?;
-        }
+        // The wait for the data connection is bounded as well as the reads.
+        // It was bare until 2026-09-21, and a client that never opened one
+        // left the session waiting for good.
+        let (stream, _) = socket::accept_tcp(&listener, self.timeout)?;
         Ok(stream)
     }
 
