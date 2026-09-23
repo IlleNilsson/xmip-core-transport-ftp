@@ -12,7 +12,7 @@
 //!
 //! What is here is RFC 959 in passive mode and binary type — the shape a
 //! firewall lets through. FTPS is TLS on both connections and joins when the
-//! transport capability's TLS reaches this socket (ADR-0033).
+//! estate's TLS (`xmip-core-tls`) reaches this socket (ADR-0033).
 //!
 //! FTP has artefacts and no locking, so [`Transport::claims`] answers
 //! [`NoNativeClaim`], ADR-0024 clause 5: a producer writes to a temporary
