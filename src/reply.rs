@@ -3,7 +3,8 @@
 
 use std::io::BufRead;
 
-use transport::error::{Result, classify, protocol_error};
+use net::{read, reply};
+use transport::error::{Result, protocol_error};
 
 /// One reply, its code and its text with the code stripped.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,17 +63,18 @@ impl Reply {
 /// Read one reply, multi-line replies (`123-` ... `123 `) joined.
 ///
 /// # Errors
-/// A connection that closed, or a line that does not open with a code.
+/// A connection that closed, or a line that does not open with a code
+/// (`net::reply::code`).
 pub fn read(reader: &mut impl BufRead) -> Result<Reply> {
     let first = line(reader)?;
-    let code = code_of(&first)?;
-    let mut text = first[4..].to_string();
-    if first.as_bytes().get(3) == Some(&b'-') {
+    let (code, continued) = reply::code(&first)?;
+    let mut text = first.get(4..).unwrap_or_default().to_string();
+    if continued {
         loop {
             let next = line(reader)?;
-            if next.len() >= 4 && code_of(&next).ok() == Some(code) && next.as_bytes()[3] == b' ' {
+            if reply::code(&next).ok() == Some((code, false)) {
                 text.push('\n');
-                text.push_str(&next[4..]);
+                text.push_str(next.get(4..).unwrap_or_default());
                 break;
             }
             text.push('\n');
@@ -83,25 +85,7 @@ pub fn read(reader: &mut impl BufRead) -> Result<Reply> {
 }
 
 fn line(reader: &mut impl BufRead) -> Result<String> {
-    let mut raw = String::new();
-    let read = reader
-        .read_line(&mut raw)
-        .map_err(|e| classify("reading a reply", &e))?;
-    if read == 0 {
-        return Err(protocol_error("the peer closed the control connection"));
-    }
-    Ok(raw.trim_end_matches(['\r', '\n']).to_string())
-}
-
-fn code_of(line: &str) -> Result<u16> {
-    let digits = line.get(..3).unwrap_or("");
-    let code: u16 = digits
-        .parse()
-        .map_err(|_| protocol_error(format!("{line:?} does not open with a reply code")))?;
-    if !(100..600).contains(&code) || line.len() < 4 {
-        return Err(protocol_error(format!("{line:?} is not a reply")));
-    }
-    Ok(code)
+    read::line(reader)?.ok_or_else(|| protocol_error("the peer closed the control connection"))
 }
 
 /// `code text` as the server writes it.
