@@ -34,7 +34,12 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, NoNativeClaim, ResourceClaim, Transport};
+use transport::{Arrived, Configured, Directions, NoNativeClaim, ResourceClaim, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Setting, Settings};
+
+/// Whether a receive deletes each file once it is a Stream, unless a
+/// Location says.
+pub const DELETE_AFTER_RETRIEVE: bool = true;
 
 #[derive(Clone)]
 pub struct FtpTransport {
@@ -51,7 +56,7 @@ impl FtpTransport {
         Self {
             server: server.into(),
             login: Login::default(),
-            delete_after_retrieve: true,
+            delete_after_retrieve: DELETE_AFTER_RETRIEVE,
             timeout: None,
         }
     }
@@ -145,6 +150,56 @@ impl Transport for FtpTransport {
     }
 }
 
+impl Configured for FtpTransport {
+    /// The address is the server's host and port: where a Location logs in.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "user",
+                kind: Kind::Text,
+                presence: Presence::Optional,
+                meaning: "The user a Location logs in as; anonymous when left out.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "delete_after_retrieve",
+                kind: Kind::Boolean,
+                presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_RETRIEVE)),
+                meaning: "Whether a receive deletes each file once it is a Stream.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a server that stops mid-transfer is waited on; unbounded \
+                          when left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    /// A named user's password comes through the Location's credentials,
+    /// never a setting; the login is built without it.
+    fn configured(address: &str, settings: &xcore::settings::Read) -> Result<Self> {
+        let mut transport = Self::new(address);
+        if let Some(user) = settings.optional_text("user") {
+            transport = transport.logging_in(Login {
+                user: user.to_string(),
+                password: String::new(),
+            });
+        }
+        if settings.optional_boolean("delete_after_retrieve") == Some(false) {
+            transport = transport.leaving_files();
+        }
+        if let Some(timeout) = settings.optional_duration("timeout") {
+            transport = transport.timing_out_after(timeout);
+        }
+        Ok(transport)
+    }
+}
+
 impl FtpTransport {
     /// Both ends on this machine: an ephemeral local port, an anonymous
     /// login, the loopback timeout on every read.
@@ -186,6 +241,31 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn ftp_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(FtpTransport::SETTINGS.problems(), Vec::<String>::new());
+        let given = [
+            ("user".to_string(), Given::Text("partner".to_string())),
+            ("delete_after_retrieve".to_string(), Given::Boolean(false)),
+            ("timeout".to_string(), Given::Text("30s".to_string())),
+        ];
+        let built = FtpTransport::open("ftp.example:21", Applies::Receive, &given).expect("built");
+        assert_eq!(built.login.user, "partner");
+        assert!(!built.delete_after_retrieve);
+        assert_eq!(built.timeout, Some(secs(30)));
+        let plain = FtpTransport::open("ftp.example:21", Applies::Send, &[]).expect("plain");
+        assert_eq!(plain.login.user, "anonymous");
+        let Err(refused) = FtpTransport::open("ftp.example:21", Applies::Send, &given[1..2]) else {
+            panic!("a Send Location deletes nothing");
+        };
+        assert!(
+            refused.message.contains("\"delete_after_retrieve\""),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]
