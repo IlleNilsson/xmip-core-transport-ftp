@@ -1,32 +1,26 @@
-//! The client's side: a control connection, and a passive data connection
-//! per transfer.
+//! The client's side: a control connection, kept between transfers, and a
+//! passive data connection per transfer — stream mode says a file has
+//! ended by closing its data connection, so that one is the protocol's to
+//! open each time.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
 use transport::error::{Result, TransportError, classify};
-use transport::socket;
+use transport::pool::{Pooled, alive};
+use transport::{Login, socket};
 
 use crate::reply::{self, Reply};
 
-/// What a Location presents when it logs in.
-#[derive(Clone, Debug)]
-pub struct Login {
-    pub user: String,
-    pub password: String,
+/// The anonymous login, what a Location presents unless it names a user.
+#[must_use]
+pub fn anonymous() -> Login {
+    Login::new("anonymous", "xmip@")
 }
 
-impl Default for Login {
-    fn default() -> Self {
-        Self {
-            user: "anonymous".to_string(),
-            password: "xmip@".to_string(),
-        }
-    }
-}
-
-/// One logged-in control connection.
+/// One logged-in control connection, kept between transfers while the
+/// server keeps it open.
 pub struct Client {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -171,6 +165,14 @@ impl Client {
         } else {
             Err(refused(what, &reply))
         }
+    }
+}
+
+impl Pooled for Client {
+    /// While the server has not closed the control connection — an idle
+    /// timeout closes it, with a 421 first.
+    fn usable(&mut self) -> bool {
+        alive(&self.writer)
     }
 }
 
