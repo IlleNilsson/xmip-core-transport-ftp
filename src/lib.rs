@@ -27,14 +27,16 @@ pub mod session;
 use std::net::TcpListener;
 use std::time::Duration;
 
-pub use client::{Client, Login};
+pub use client::{Client, anonymous};
 pub use reply::Reply;
 pub use session::{Event, Session};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, NoNativeClaim, ResourceClaim, Transport};
+use transport::{
+    Arrived, Configured, Directions, Login, NoNativeClaim, Pool, ResourceClaim, Transport,
+};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Setting, Settings};
 
 /// Whether a receive deletes each file once it is a Stream, unless a
@@ -47,6 +49,9 @@ pub struct FtpTransport {
     login: Login,
     delete_after_retrieve: bool,
     timeout: Option<Duration>,
+    /// The control connections a send stores on, logged in once per server
+    /// and kept.
+    controls: Pool<Client>,
 }
 
 impl FtpTransport {
@@ -55,9 +60,10 @@ impl FtpTransport {
     pub fn new(server: impl Into<String>) -> Self {
         Self {
             server: server.into(),
-            login: Login::default(),
+            login: anonymous(),
             delete_after_retrieve: DELETE_AFTER_RETRIEVE,
             timeout: None,
+            controls: Pool::new(),
         }
     }
 
@@ -138,11 +144,15 @@ impl Transport for FtpTransport {
         Ok(arrived)
     }
 
+    /// STOR on the control connection kept for the server, logged in on
+    /// the first send to it; the data connection is the transfer's own.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, name) = self.resolve(target);
-        let mut client = Client::connect(server, &self.login, self.timeout)?;
-        client.store(name, bytes)?;
-        client.quit()
+        self.controls.exchange(
+            server,
+            || Client::connect(server, &self.login, self.timeout),
+            |client| client.store(name, bytes),
+        )
     }
 
     fn claims(&self) -> Option<&dyn ResourceClaim> {
@@ -185,10 +195,7 @@ impl Configured for FtpTransport {
     fn configured(address: &str, settings: &xcore::settings::Read) -> Result<Self> {
         let mut transport = Self::new(address);
         if let Some(user) = settings.optional_text("user") {
-            transport = transport.logging_in(Login {
-                user: user.to_string(),
-                password: String::new(),
-            });
+            transport = transport.logging_in(Login::new(user, ""));
         }
         if settings.optional_boolean("delete_after_retrieve") == Some(false) {
             transport = transport.leaving_files();
@@ -211,14 +218,10 @@ impl FtpTransport {
 
 impl Accepting for FtpTransport {
     fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
-        let mut session = self.accept_one(listener)?;
-        let arrived = session
+        // The client keeps its control connection for the next store.
+        self.accept_one(listener)?
             .next_store()?
-            .ok_or_else(|| protocol_error("the client quit without storing"))?;
-        // Serve the QUIT that follows, so the client's goodbye is answered
-        // rather than met by a closed socket.
-        session.next_store()?;
-        Ok(arrived)
+            .ok_or_else(|| protocol_error("the client quit without storing"))
     }
 }
 
@@ -306,16 +309,16 @@ mod tests {
             arrived.sort_by(|a, b| a.origin_uri.cmp(&b.origin_uri));
             Ok::<_, transport::TransportError>(arrived)
         });
+        // One server, so one control connection for both stores.
         let mut session = far_end.accept_one(&listener).expect("accepting");
         let first = session.next_store().expect("first").expect("one");
         assert_eq!(first.bytes, b"UNA:+.? '");
         assert!(first.origin_uri.ends_with("/orders/1.edi"));
-        assert!(session.next_store().expect("quit").is_none());
-        let mut session = far_end.accept_one(&listener).expect("second");
         let second = session.next_store().expect("second").expect("one");
         assert!(second.bytes.is_empty());
-        assert!(session.next_store().expect("quit").is_none());
-        let files = session.files().clone();
+        let mut files = session.files().clone();
+        files.remove("orders/1.edi");
+        drop(session);
         let mut session = far_end
             .accept_one(&listener)
             .expect("third")
@@ -330,6 +333,35 @@ mod tests {
         assert_eq!(arrived[0].bytes, b"");
         assert!(arrived[0].origin_uri.ends_with("/2.edi"));
         assert!(session.files().is_empty(), "deleted after retrieve");
+    }
+
+    #[test]
+    fn a_hundred_stores_log_in_once_and_a_connection_the_server_closed_is_replaced() {
+        // A hundred rather than a thousand: each store opens its own data
+        // connection, which is the protocol's, and spends a local port.
+        const SENDS: usize = 100;
+        let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = FtpTransport::new(address).timing_out_after(secs(5));
+        let sending = near.clone();
+        let sender = std::thread::spawn(move || {
+            for n in 0..SENDS {
+                sending.send(&format!("{n}.edi"), n.to_string().as_bytes())?;
+            }
+            sending.send("last.edi", b"after the close")
+        });
+        // One USER and PASS for every store: one control connection.
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        for n in 0..SENDS {
+            let stored = session.next_store().expect("store").expect("one");
+            assert_eq!(stored.bytes, n.to_string().as_bytes());
+        }
+        drop(session);
+        let mut again = far_end.accept_one(&listener).expect("a new connection");
+        let last = again.next_store().expect("store").expect("one");
+        assert_eq!(last.bytes, b"after the close");
+        sender.join().expect("thread").expect("sending");
+        assert_eq!(near.controls.opened(), 2);
     }
 
     #[test]
