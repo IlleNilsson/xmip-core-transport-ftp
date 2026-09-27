@@ -8,10 +8,11 @@
 //! [`crate::Client`].
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
+use net::read;
 use transport::Arrived;
 use transport::error::{Result, classify, protocol_error};
 use transport::socket;
@@ -92,16 +93,10 @@ impl Session {
     /// Where the connection broke, or nothing arrived before the timeout.
     pub fn next_event(&mut self) -> Result<Option<Event>> {
         loop {
-            let mut line = String::new();
-            let read = self
-                .reader
-                .read_line(&mut line)
-                .map_err(|e| classify("reading a command", &e))?;
-            if read == 0 {
+            let Some(line) = read::line(&mut self.reader)? else {
                 return Ok(None);
-            }
-            let line = line.trim_end_matches(['\r', '\n']);
-            let (verb, argument) = line.split_once(' ').unwrap_or((line, ""));
+            };
+            let (verb, argument) = line.split_once(' ').unwrap_or((&line, ""));
             match verb.to_ascii_uppercase().as_str() {
                 "USER" => self.reply(331, "password please")?,
                 "PASS" => self.reply(230, "logged in")?,
@@ -173,9 +168,7 @@ impl Session {
         }
         self.reply(150, "ok to send data")?;
         let mut data = self.data()?;
-        let mut bytes = Vec::new();
-        data.read_to_end(&mut bytes)
-            .map_err(|e| classify("reading the data", &e))?;
+        let bytes = read::to_end(&mut data, net::MAX_BODY)?;
         drop(data);
         self.files.insert(name.to_string(), bytes.clone());
         self.reply(226, "transfer complete")?;

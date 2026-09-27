@@ -1,7 +1,7 @@
 //! The client's side: a control connection, and a passive data connection
 //! per transfer.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -100,16 +100,15 @@ impl Client {
     /// Retrieve `name` from the current directory.
     ///
     /// # Errors
-    /// Where the file is not there, or the data connection broke.
+    /// Where the file is not there, the data connection broke, or it carried
+    /// more than `net::MAX_BODY`.
     pub fn retrieve(&mut self, name: &str) -> Result<Vec<u8>> {
         let mut data = self.passive()?;
         let opened = self.command(&format!("RETR {name}"))?;
         if !opened.is_preliminary() {
             return Err(refused("the retrieve", &opened));
         }
-        let mut bytes = Vec::new();
-        data.read_to_end(&mut bytes)
-            .map_err(|e| classify("reading the data", &e))?;
+        let bytes = net::read::to_end(&mut data, net::MAX_BODY)?;
         drop(data);
         self.completion("the retrieve")?;
         Ok(bytes)
