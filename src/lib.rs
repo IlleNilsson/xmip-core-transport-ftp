@@ -28,6 +28,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::{Client, anonymous};
+use net::Target;
 pub use reply::Reply;
 pub use session::{Event, Session};
 use transport::error::{Result, protocol_error};
@@ -49,8 +50,8 @@ pub struct FtpTransport {
     login: Login,
     delete_after_retrieve: bool,
     timeout: Option<Duration>,
-    /// The control connections a send stores on, logged in once per server
-    /// and kept.
+    /// The control connections a send stores on and a receive retrieves on,
+    /// logged in once per server and kept.
     controls: Pool<Client>,
 }
 
@@ -115,7 +116,9 @@ impl FtpTransport {
     /// Where a target names the server and file itself — `ftp://host/name`
     /// — or is a name alone on this transport's server.
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        socket::target("ftp", target).unwrap_or((&self.server, target))
+        Target::under(&["ftp"], target).map_or((&self.server, target), |named| {
+            (named.authority(), named.path())
+        })
     }
 }
 
@@ -129,19 +132,24 @@ impl Transport for FtpTransport {
     }
 
     /// Every file in the directory, each deleted once retrieved unless the
-    /// transport was told to leave them.
+    /// transport was told to leave them, on the control connection kept
+    /// for the server: logged in on the first receive.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let mut client = self.connect()?;
-        let mut arrived = Vec::new();
-        for name in client.names()? {
-            let bytes = client.retrieve(&name)?;
-            if self.delete_after_retrieve {
-                client.delete(&name)?;
-            }
-            arrived.push(Arrived::new(format!("ftp://{}/{name}", self.server), bytes));
-        }
-        client.quit()?;
-        Ok(arrived)
+        self.controls.exchange(
+            self.server.as_str(),
+            || self.connect(),
+            |client| {
+                let mut arrived = Vec::new();
+                for name in client.names()? {
+                    let bytes = client.retrieve(&name)?;
+                    if self.delete_after_retrieve {
+                        client.delete(&name)?;
+                    }
+                    arrived.push(Arrived::new(format!("ftp://{}/{name}", self.server), bytes));
+                }
+                Ok(arrived)
+            },
+        )
     }
 
     /// STOR on the control connection kept for the server, logged in on
@@ -309,29 +317,24 @@ mod tests {
             arrived.sort_by(|a, b| a.origin_uri.cmp(&b.origin_uri));
             Ok::<_, transport::TransportError>(arrived)
         });
-        // One server, so one control connection for both stores.
+        // One server, so one control connection for both stores and the
+        // receive that takes them back.
         let mut session = far_end.accept_one(&listener).expect("accepting");
         let first = session.next_store().expect("first").expect("one");
         assert_eq!(first.bytes, b"UNA:+.? '");
         assert!(first.origin_uri.ends_with("/orders/1.edi"));
         let second = session.next_store().expect("second").expect("one");
         assert!(second.bytes.is_empty());
-        let mut files = session.files().clone();
-        files.remove("orders/1.edi");
-        drop(session);
-        let mut session = far_end
-            .accept_one(&listener)
-            .expect("third")
-            .with_files(files);
         let mut events = Vec::new();
         while let Some(event) = session.next_event().expect("serving") {
             events.push(event);
         }
-        assert_eq!(events.len(), 2, "one retrieve and one delete: {events:?}");
+        assert_eq!(events.len(), 4, "two retrieves and two deletes: {events:?}");
         let arrived = sender.join().expect("thread").expect("round trip");
-        assert_eq!(arrived.len(), 1);
+        assert_eq!(arrived.len(), 2);
         assert_eq!(arrived[0].bytes, b"");
         assert!(arrived[0].origin_uri.ends_with("/2.edi"));
+        assert_eq!(arrived[1].bytes, b"UNA:+.? '");
         assert!(session.files().is_empty(), "deleted after retrieve");
     }
 
@@ -362,6 +365,36 @@ mod tests {
         assert_eq!(last.bytes, b"after the close");
         sender.join().expect("thread").expect("sending");
         assert_eq!(near.controls.opened(), 2);
+    }
+
+    #[test]
+    fn a_hundred_receives_log_in_once_and_a_connection_the_server_closed_is_replaced() {
+        // Each receive lists the directory on a data connection of its own,
+        // which is the protocol's; the control connection is kept.
+        const RECEIVES: usize = 100;
+        let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = FtpTransport::new(address).timing_out_after(secs(5));
+        let (go, going) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            for _ in 0..RECEIVES {
+                assert!(near.receive()?.is_empty());
+            }
+            // A store on the same kept connection says the listings are done.
+            near.send("listed.edi", b"listed")?;
+            going.recv().expect("go");
+            Ok::<_, transport::TransportError>((near.receive()?, near.controls.opened()))
+        });
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let marker = session.next_store().expect("served").expect("the store");
+        assert_eq!(marker.bytes, b"listed");
+        drop(session);
+        go.send(()).expect("went");
+        let mut again = far_end.accept_one(&listener).expect("a new connection");
+        assert!(again.next_event().expect("served").is_none());
+        let (arrived, opened) = receiver.join().expect("thread").expect("listed");
+        assert!(arrived.is_empty());
+        assert_eq!(opened, 2);
     }
 
     #[test]
