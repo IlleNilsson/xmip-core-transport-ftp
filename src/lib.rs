@@ -3,7 +3,7 @@
 //! Streams that arrive as files over FTP. One file is one Stream, its name
 //! kept beside it.
 //!
-//! FTP is the partner drop box that predates every other one: a control
+//! FTP is the Party drop box that predates every other one: a control
 //! connection on port 21, a data connection per transfer, files in
 //! directories. A Receive Location logs in, lists a directory and retrieves
 //! what is there, deleting each file once it is safely a Stream; a Send
@@ -259,12 +259,12 @@ mod tests {
         use xcore::settings::Given;
         assert_eq!(FtpTransport::SETTINGS.problems(), Vec::<String>::new());
         let given = [
-            ("user".to_string(), Given::Text("partner".to_string())),
+            ("user".to_string(), Given::Text("party".to_string())),
             ("delete_after_retrieve".to_string(), Given::Boolean(false)),
             ("timeout".to_string(), Given::Text("30s".to_string())),
         ];
         let built = FtpTransport::open("ftp.example:21", Applies::Receive, &given).expect("built");
-        assert_eq!(built.login.user, "partner");
+        assert_eq!(built.login.user, "party");
         assert!(!built.delete_after_retrieve);
         assert_eq!(built.timeout, Some(secs(30)));
         let plain = FtpTransport::open("ftp.example:21", Applies::Send, &[]).expect("plain");
