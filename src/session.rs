@@ -13,17 +13,17 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 use net::read;
-use transport::Arrived;
 use transport::error::{Result, classify, protocol_error};
 use transport::socket;
+use transport::taken::Taken;
 
 use crate::reply::format;
 
 /// What the client did, as [`Session::next_event`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// The client stored a file; here is the Stream.
-    Stored(Arrived),
+    /// The client stored a file; here is what it stored.
+    Stored(Taken),
     /// The client retrieved this name.
     Retrieved(String),
     /// The client deleted this name.
@@ -76,7 +76,7 @@ impl Session {
     ///
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
-    pub fn next_store(&mut self) -> Result<Option<Arrived>> {
+    pub fn next_store(&mut self) -> Result<Option<Taken>> {
         loop {
             match self.next_event()? {
                 Some(Event::Stored(arrived)) => return Ok(Some(arrived)),
@@ -172,7 +172,7 @@ impl Session {
         drop(data);
         self.files.insert(name.to_string(), bytes.clone());
         self.reply(226, "transfer complete")?;
-        Ok(Event::Stored(Arrived::new(
+        Ok(Event::Stored(Taken::new(
             format!("ftp://{}/{name}", self.peer),
             bytes,
         )))

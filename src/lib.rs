@@ -5,9 +5,10 @@
 //!
 //! FTP is the Party drop box that predates every other one: a control
 //! connection on port 21, a data connection per transfer, files in
-//! directories. A Receive Location logs in, lists a directory and retrieves
-//! what is there, deleting each file once it is safely a Stream; a Send
-//! Location logs in and stores. Either may instead accept clients directly
+//! directories. A Receive Location logs in, lists a directory and hands each
+//! file back unread: the runtime reads its transfer as it asks, and the file
+//! is deleted only when the receive cycle accepted it; a Send Location logs
+//! in and stores. Either may instead accept clients directly
 //! through [`Session`], one client's worth of server over one directory.
 //!
 //! What is here is RFC 959 in passive mode and binary type — the shape a
@@ -21,6 +22,7 @@
 //! The origin URI carries what the server knew: `ftp://server/orders/1.edi`.
 
 pub mod client;
+pub mod control;
 pub mod reply;
 pub mod session;
 
@@ -28,6 +30,7 @@ use std::net::TcpListener;
 use std::time::Duration;
 
 pub use client::{Client, anonymous};
+pub use control::Control;
 use net::Target;
 pub use reply::Reply;
 pub use session::{Event, Session};
@@ -35,13 +38,13 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
+use transport::taken::Taken;
 use transport::{
     Arrived, Configured, Directions, Login, NoNativeClaim, Pool, ResourceClaim, Transport,
 };
 use xcore::settings::{Applies, Fixed, Kind, Presence, Setting, Settings};
 
-/// Whether a receive deletes each file once it is a Stream, unless a
-/// Location says.
+/// Whether an accepted file is deleted, unless a Location says.
 pub const DELETE_AFTER_RETRIEVE: bool = true;
 
 #[derive(Clone)]
@@ -51,8 +54,9 @@ pub struct FtpTransport {
     delete_after_retrieve: bool,
     timeout: Option<Duration>,
     /// The control connections a send stores on and a receive retrieves on,
-    /// logged in once per server and kept.
-    controls: Pool<Client>,
+    /// logged in once per server and kept, shared with what a receive
+    /// handed back until each is acknowledged.
+    controls: Pool<Control>,
 }
 
 impl FtpTransport {
@@ -75,7 +79,7 @@ impl FtpTransport {
         self
     }
 
-    /// Leave retrieved files in place rather than deleting them.
+    /// Leave accepted files in place rather than deleting them.
     #[must_use]
     pub const fn leaving_files(mut self) -> Self {
         self.delete_after_retrieve = false;
@@ -131,23 +135,29 @@ impl Transport for FtpTransport {
         Directions::BOTH
     }
 
-    /// Every file in the directory, each deleted once retrieved unless the
-    /// transport was told to leave them, on the control connection kept
-    /// for the server: logged in on the first receive.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered("a receive lists again what is not yet told")
+    }
+
+    /// Every file in the directory, listed on the control connection kept
+    /// for the server, logged in on the first receive, and handed back
+    /// unread. Each body is its `RETR`, read as the runtime asks, and its
+    /// server's completion; `Accepted` and `Refused` delete the file
+    /// (`DELE`) unless the transport was told to leave files, `Failed`
+    /// leaves it for the next receive.
     fn receive(&self) -> Result<Vec<Arrived>> {
         self.controls.exchange(
             self.server.as_str(),
-            || self.connect(),
-            |client| {
-                let mut arrived = Vec::new();
-                for name in client.names()? {
-                    let bytes = client.retrieve(&name)?;
-                    if self.delete_after_retrieve {
-                        client.delete(&name)?;
-                    }
-                    arrived.push(Arrived::new(format!("ftp://{}/{name}", self.server), bytes));
-                }
-                Ok(arrived)
+            || self.connect().map(Control::new),
+            |control| {
+                let names = control.with(Client::names)?;
+                Ok(names
+                    .into_iter()
+                    .map(|name| {
+                        let origin = format!("ftp://{}/{name}", self.server);
+                        control.arrival(origin, name, self.delete_after_retrieve)
+                    })
+                    .collect())
             },
         )
     }
@@ -158,8 +168,8 @@ impl Transport for FtpTransport {
         let (server, name) = self.resolve(target);
         self.controls.exchange(
             server,
-            || Client::connect(server, &self.login, self.timeout),
-            |client| client.store(name, bytes),
+            || Client::connect(server, &self.login, self.timeout).map(Control::new),
+            |control| control.with(|client| client.store(name, bytes)),
         )
     }
 
@@ -184,7 +194,7 @@ impl Configured for FtpTransport {
                 name: "delete_after_retrieve",
                 kind: Kind::Boolean,
                 presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_RETRIEVE)),
-                meaning: "Whether a receive deletes each file once it is a Stream.",
+                meaning: "Whether a file is deleted once its receive cycle accepted it.",
                 applies: Applies::Receive,
             },
             Setting {
@@ -225,7 +235,7 @@ impl FtpTransport {
 }
 
 impl Accepting for FtpTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         // The client keeps its control connection for the next store.
         self.accept_one(listener)?
             .next_store()?
@@ -315,7 +325,10 @@ mod tests {
             near.send(&format!("ftp://{address}/2.edi"), b"")?;
             let mut arrived = near.receive()?;
             arrived.sort_by(|a, b| a.origin_uri.cmp(&b.origin_uri));
-            Ok::<_, transport::TransportError>(arrived)
+            arrived
+                .into_iter()
+                .map(Arrived::taken)
+                .collect::<Result<Vec<_>>>()
         });
         // One server, so one control connection for both stores and the
         // receive that takes them back.
@@ -336,6 +349,73 @@ mod tests {
         assert!(arrived[0].origin_uri.ends_with("/2.edi"));
         assert_eq!(arrived[1].bytes, b"UNA:+.? '");
         assert!(session.files().is_empty(), "deleted after retrieve");
+    }
+
+    #[test]
+    fn a_failed_file_stays_on_the_server_and_an_accepted_one_is_deleted() {
+        let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let receiver = std::thread::spawn(move || {
+            let near = FtpTransport::new(address).timing_out_after(secs(2));
+            let first = transport::arrived::one_arrival(near.receive()?, "listed")?;
+            assert!(first.defers());
+            let (_, mut body, acknowledgement) = first.into_parts();
+            let mut read = Vec::new();
+            std::io::Read::read_to_end(&mut body, &mut read).expect("reading");
+            drop(body);
+            acknowledgement.acknowledge(transport::Verdict::Failed)?;
+            let again = transport::arrived::one_arrival(near.receive()?, "listed again")?;
+            Ok::<_, transport::TransportError>((read, again.taken()?))
+        });
+        let files = std::collections::BTreeMap::from([("1.edi".to_string(), b"UNB".to_vec())]);
+        let mut session = far_end
+            .accept_one(&listener)
+            .expect("accepting")
+            .with_files(files);
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().expect("serving") {
+            events.push(event);
+        }
+        let (read, taken) = receiver.join().expect("thread").expect("received");
+        assert_eq!(
+            (read.as_slice(), taken.bytes.as_slice()),
+            (&b"UNB"[..], &b"UNB"[..])
+        );
+        let one = "1.edi".to_string();
+        assert_eq!(
+            events,
+            [
+                Event::Retrieved(one.clone()),
+                Event::Retrieved(one.clone()),
+                Event::Deleted(one)
+            ],
+            "the failed retrieve deleted nothing"
+        );
+        assert!(session.files().is_empty(), "deleted once accepted");
+    }
+
+    #[test]
+    fn a_refused_file_is_deleted_and_not_listed_again() {
+        let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let receiver = std::thread::spawn(move || {
+            let near = FtpTransport::new(address).timing_out_after(secs(2));
+            let first = transport::arrived::one_arrival(near.receive()?, "listed")?;
+            first.refused(transport::Refusal::Unacceptable)?;
+            Ok::<_, transport::TransportError>(near.receive()?.len())
+        });
+        let files = std::collections::BTreeMap::from([("1.edi".to_string(), b"UNB".to_vec())]);
+        let mut session = far_end
+            .accept_one(&listener)
+            .expect("accepting")
+            .with_files(files);
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().expect("serving") {
+            events.push(event);
+        }
+        assert_eq!(receiver.join().expect("thread").expect("received"), 0);
+        assert_eq!(events, [Event::Deleted("1.edi".to_string())], "unread");
+        assert!(session.files().is_empty(), "deleted once refused");
     }
 
     #[test]
