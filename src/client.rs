@@ -91,21 +91,28 @@ impl Client {
         self.completion("the store")
     }
 
-    /// Retrieve `name` from the current directory.
+    /// Start retrieving `name` from the current directory: the data
+    /// connection to read it from, to its end. The control connection is
+    /// the transfer's until [`Self::retrieved`] reads its completion.
     ///
     /// # Errors
-    /// Where the file is not there, the data connection broke, or it carried
-    /// more than `net::MAX_BODY`.
-    pub fn retrieve(&mut self, name: &str) -> Result<Vec<u8>> {
-        let mut data = self.passive()?;
+    /// Where the file is not there or the data connection could not open.
+    pub fn retrieving(&mut self, name: &str) -> Result<TcpStream> {
+        let data = self.passive()?;
         let opened = self.command(&format!("RETR {name}"))?;
         if !opened.is_preliminary() {
             return Err(refused("the retrieve", &opened));
         }
-        let bytes = net::read::to_end(&mut data, net::MAX_BODY)?;
-        drop(data);
-        self.completion("the retrieve")?;
-        Ok(bytes)
+        Ok(data)
+    }
+
+    /// The server's completion of a retrieve whose data connection was read
+    /// to its end and closed.
+    ///
+    /// # Errors
+    /// Where the server said the transfer failed.
+    pub fn retrieved(&mut self) -> Result<()> {
+        self.completion("the retrieve")
     }
 
     /// The names in the current directory, one per line of `NLST`.

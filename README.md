@@ -6,6 +6,10 @@ A Send Location stores on a control connection logged in once per server and kep
 
 A Receive Location lists, retrieves and deletes on the same kept control connection. Until 2026-09-28 every receive logged in and quit.
 
+## Acknowledgement
+
+A file is consumed only after the runtime's whole receive cycle. A receive lists the directory (`NLST`) and hands each file back unread; its body is its `RETR`, the data connection read as the runtime asks, never whole in memory, and then the server's `226`. `Accepted` sends `DELE` (unless `delete_after_retrieve = false`). `Refused` sends `DELE` too, under the same setting: a directory has no place for a refused file, the runtime audited the refusal, and from Message creation on the Stream is kept in Xmip (ADR-0013); left, it would be listed and refused again on every receive. `Failed` leaves the file, and the next receive lists it again. The control connection stays in the pool, shared with the arrivals until each is acknowledged; a send that finds a transfer running on it opens a connection of its own. Until 2026-10-02 a receive retrieved and deleted every file before handing it back.
+
 A send target is read by `net::Target` in [xmip-core-library-net](https://github.com/IlleNilsson/xmip-core-library-net), the one reading of a URI every technology calls: scheme, authority, path and decoded query. Until 2026-09-28 it was read through the transport capability's `socket::target`, which split it on its first slash and left the query in the path.
 
 ## Toolchain
