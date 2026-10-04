@@ -40,7 +40,7 @@ use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::taken::Taken;
 use transport::{
-    Arrived, Configured, Directions, Login, NoNativeClaim, Pool, ResourceClaim, Transport,
+    Arrived, Configured, Directions, Login, NoNativeClaim, Pool, Refused, ResourceClaim, Transport,
 };
 use xcore::settings::{Applies, Fixed, Kind, Presence, Setting, Settings};
 
@@ -57,6 +57,9 @@ pub struct FtpTransport {
     /// logged in once per server and kept, shared with what a receive
     /// handed back until each is acknowledged.
     controls: Pool<Control>,
+    /// The files refused and left, not listed again while unchanged.
+    /// Cloned, the same memory.
+    refused: Refused<String, String>,
 }
 
 impl FtpTransport {
@@ -69,6 +72,7 @@ impl FtpTransport {
             delete_after_retrieve: DELETE_AFTER_RETRIEVE,
             timeout: None,
             controls: Pool::new(),
+            refused: Refused::default(),
         }
     }
 
@@ -141,9 +145,11 @@ impl Transport for FtpTransport {
 
     /// Every file in the directory, listed on the control connection kept
     /// for the server, logged in on the first receive, and handed back
-    /// unread. Each body is its `RETR`, read as the runtime asks, and its
-    /// server's completion; `Accepted` and `Refused` delete the file
-    /// (`DELE`) unless the transport was told to leave files, `Failed`
+    /// unread, but those refused and still as they were refused — each
+    /// stamped (`SIZE`, `MDTM`) only where it was refused. Each body is its
+    /// `RETR`, read as the runtime asks, and its server's completion;
+    /// `Accepted` deletes the file (`DELE`) unless the transport was told
+    /// to leave files, `Refused` leaves it and remembers it, `Failed`
     /// leaves it for the next receive.
     fn receive(&self) -> Result<Vec<Arrived>> {
         self.controls.exchange(
@@ -151,11 +157,15 @@ impl Transport for FtpTransport {
             || self.connect().map(Control::new),
             |control| {
                 let names = control.with(Client::names)?;
-                Ok(names
+                let stamp = |name: &String| control.with(|client| client.stamp(name)).ok()?;
+                Ok(self
+                    .refused
+                    .sift(names, |name| name, stamp)
                     .into_iter()
                     .map(|name| {
                         let origin = format!("ftp://{}/{name}", self.server);
-                        control.arrival(origin, name, self.delete_after_retrieve)
+                        let refused = self.refused.clone();
+                        control.arrival(origin, name, self.delete_after_retrieve, refused)
                     })
                     .collect())
             },
@@ -395,14 +405,18 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_file_is_deleted_and_not_listed_again() {
+    fn a_refused_file_is_left_and_not_listed_again_until_stored_again() {
         let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
             let near = FtpTransport::new(address).timing_out_after(secs(2));
             let first = transport::arrived::one_arrival(near.receive()?, "listed")?;
             first.refused(transport::Refusal::Unacceptable)?;
-            Ok::<_, transport::TransportError>(near.receive()?.len())
+            let unchanged = near.receive()?.len();
+            near.send("1.edi", b"UNB again")?;
+            let again = transport::arrived::one_arrival(near.receive()?, "stored again")?;
+            again.refused(transport::Refusal::Unacceptable)?;
+            Ok::<_, transport::TransportError>(unchanged)
         });
         let files = std::collections::BTreeMap::from([("1.edi".to_string(), b"UNB".to_vec())]);
         let mut session = far_end
@@ -414,8 +428,17 @@ mod tests {
             events.push(event);
         }
         assert_eq!(receiver.join().expect("thread").expect("received"), 0);
-        assert_eq!(events, [Event::Deleted("1.edi".to_string())], "unread");
-        assert!(session.files().is_empty(), "deleted once refused");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Deleted(_))),
+            "nothing deleted: {events:?}"
+        );
+        assert_eq!(
+            session.files().get("1.edi").map(Vec::as_slice),
+            Some(&b"UNB again"[..]),
+            "the refused file is still there"
+        );
     }
 
     #[test]

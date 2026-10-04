@@ -4,7 +4,7 @@
 //! A receive lists on the control connection and hands each file back
 //! unread: its body opens the transfer when the runtime first reads it and
 //! reads the server's completion at its end, and its acknowledgement
-//! deletes it on `Accepted`. Both need the control connection after the
+//! deletes it on `Accepted` and stamps it on `Refused`. Both need the control connection after the
 //! receive has put it back in the pool, so the pool keeps it shared. The
 //! lock is held for one command and its reply, never while the data
 //! connection is read; a send or a receive that finds a transfer running
@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use transport::body::opened;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::pool::Pooled;
-use transport::{Acknowledgement, Arrived, Verdict};
+use transport::{Acknowledgement, Arrived, Refused, Verdict};
 
 use crate::client::Client;
 
@@ -67,18 +67,30 @@ impl Control {
     }
 
     /// `name`, listed on this connection, as an arrival from `origin`: read
-    /// as the runtime asks, deleted on `Accepted` and on `Refused` where
-    /// `delete` says — a directory has no place for a refused file — and
-    /// left on `Failed`.
+    /// as the runtime asks, deleted on `Accepted` where `delete` says, left
+    /// on `Failed`. A refusal is not a consumption: on `Refused` the file is
+    /// left where it lies, the only copy, and remembered in `refused` with
+    /// its stamp ([`Client::stamp`]) so no receive lists it again while it
+    /// is unchanged.
     #[must_use]
-    pub fn arrival(&self, origin: String, name: String, delete: bool) -> Arrived {
+    pub fn arrival(
+        &self,
+        origin: String,
+        name: String,
+        delete: bool,
+        refused: Refused<String, String>,
+    ) -> Arrived {
         let control = self.clone();
-        let deleting = name.clone();
+        let told = name.clone();
         let acknowledgement = Acknowledgement::deferred(move |verdict| match verdict {
-            Verdict::Accepted | Verdict::Refused(_) if delete => {
-                control.with(|client| client.delete(&deleting))
+            Verdict::Accepted if delete => control.with(|client| client.delete(&told)),
+            Verdict::Refused(_) => {
+                if let Some(stamp) = control.with(|client| client.stamp(&told))? {
+                    refused.remember(told, stamp);
+                }
+                Ok(())
             }
-            Verdict::Accepted | Verdict::Refused(_) | Verdict::Failed => Ok(()),
+            Verdict::Accepted | Verdict::Failed => Ok(()),
         });
         let control = self.clone();
         let body = opened(move || {

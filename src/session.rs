@@ -3,7 +3,9 @@
 //!
 //! Not an FTP server. One session serves one client over one directory kept
 //! in memory: what is stored is handed up as a Stream, what was given is
-//! served to `RETR` and `NLST`. Users are not checked; a Location that needs
+//! served to `RETR` and `NLST`, its length to `SIZE` and its write to
+//! `MDTM` (RFC 3659) — the session's clock counts its stores, so a file
+//! stored again has another modification time. Users are not checked; a Location that needs
 //! accounts and a file system behind them talks to a server through
 //! [`crate::Client`].
 
@@ -36,6 +38,9 @@ pub struct Session {
     peer: SocketAddr,
     timeout: Option<Duration>,
     files: BTreeMap<String, Vec<u8>>,
+    /// The store that last wrote each file: 0 for what was given.
+    written: BTreeMap<String, u64>,
+    stores: u64,
     passive: Option<TcpListener>,
 }
 
@@ -53,6 +58,8 @@ impl Session {
             peer,
             timeout,
             files: BTreeMap::new(),
+            written: BTreeMap::new(),
+            stores: 0,
             passive: None,
         };
         session.reply(220, "xmip ready")?;
@@ -62,6 +69,7 @@ impl Session {
     /// Serve these names to `RETR` and `NLST`.
     #[must_use]
     pub fn with_files(mut self, files: BTreeMap<String, Vec<u8>>) -> Self {
+        self.written = files.keys().map(|name| (name.clone(), 0)).collect();
         self.files = files;
         self
     }
@@ -111,8 +119,17 @@ impl Session {
                     }
                 }
                 "NLST" | "LIST" => self.list()?,
+                "SIZE" => match self.files.get(argument) {
+                    Some(bytes) => self.reply(213, &bytes.len().to_string())?,
+                    None => self.reply(550, "no such file")?,
+                },
+                "MDTM" => match self.written.get(argument) {
+                    Some(store) => self.reply(213, &format!("19700101{store:06}"))?,
+                    None => self.reply(550, "no such file")?,
+                },
                 "DELE" => {
                     if self.files.remove(argument).is_some() {
+                        self.written.remove(argument);
                         self.reply(250, "deleted")?;
                         return Ok(Some(Event::Deleted(argument.to_string())));
                     }
@@ -171,6 +188,8 @@ impl Session {
         let bytes = read::to_end(&mut data, net::MAX_BODY)?;
         drop(data);
         self.files.insert(name.to_string(), bytes.clone());
+        self.stores += 1;
+        self.written.insert(name.to_string(), self.stores);
         self.reply(226, "transfer complete")?;
         Ok(Event::Stored(Taken::new(
             format!("ftp://{}/{name}", self.peer),

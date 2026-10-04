@@ -134,6 +134,26 @@ impl Client {
         Ok(names)
     }
 
+    /// What says `name` is unchanged: its length (`SIZE`) and its
+    /// modification time (`MDTM`), RFC 3659, as the server writes them.
+    /// `None` where the server answers neither — it then cannot say.
+    ///
+    /// # Errors
+    /// Where the control connection broke.
+    pub fn stamp(&mut self, name: &str) -> Result<Option<String>> {
+        let size = self.command(&format!("SIZE {name}"))?;
+        let time = self.command(&format!("MDTM {name}"))?;
+        let answered = |reply: &Reply| (reply.code == 213).then(|| reply.text.clone());
+        Ok(match (answered(&size), answered(&time)) {
+            (None, None) => None,
+            (size, time) => Some(format!(
+                "{} {}",
+                size.unwrap_or_default(),
+                time.unwrap_or_default()
+            )),
+        })
+    }
+
     /// Delete `name`.
     ///
     /// # Errors
