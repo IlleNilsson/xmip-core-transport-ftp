@@ -34,6 +34,7 @@ pub use control::Control;
 use net::Target;
 pub use reply::Reply;
 pub use session::{Event, Session};
+use transport::ArrivalIdentity;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
@@ -254,6 +255,12 @@ impl Accepting for FtpTransport {
 }
 
 impl Loopback for FtpTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "a file names no sender: the share it was taken from is in its origin",
+        )
+    }
+
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
