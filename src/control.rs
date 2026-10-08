@@ -100,7 +100,7 @@ impl Control {
                 data: Some(data),
             })
         });
-        Arrived::new(origin, body, acknowledgement)
+        Arrived::new(origin, body, acknowledgement).detected()
     }
 
     /// Open the transfer of `name`: the control connection is the
