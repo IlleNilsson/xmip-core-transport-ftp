@@ -144,6 +144,10 @@ impl Transport for FtpTransport {
         transport::Arrivals::Ordered("a receive lists again what is not yet told")
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Polled("a receive lists the directory and returns")
+    }
+
     /// Every file in the directory, listed on the control connection kept
     /// for the server, logged in on the first receive, and handed back
     /// unread, but those refused and still as they were refused — each
