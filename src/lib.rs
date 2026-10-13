@@ -12,19 +12,34 @@
 //! through [`Session`], one client's worth of server over one directory.
 //!
 //! What is here is RFC 959 in passive mode and binary type — the shape a
-//! firewall lets through. FTPS is TLS on both connections and joins when the
-//! estate's TLS (`xmip-core-library-tls`) reaches this socket (ADR-0033).
+//! firewall lets through — and, behind the `tls` feature, FTPS: RFC 4217's
+//! `AUTH TLS` and `PROT P` over the estate's TLS (`xmip-core-library-tls`,
+//! ADR-0033), the control connection and every data connection guarded
+//! ([`FtpTransport::secured`], the `tls` setting).
 //!
-//! FTP has artefacts and no locking, so [`Transport::claims`] answers
-//! [`NoNativeClaim`], ADR-0024 clause 5: a producer writes to a temporary
-//! name and renames, or a Location waits for a listing to stop changing.
+//! **A file is taken once it is finished, and by one node** (ADR-0024,
+//! amendment 2026-10-13): the file family's claim, written once in the
+//! transport capability (`transport::claim`), in FTP's words (`control.rs`)
+//! — a listing takes a file whose size and modification time are what the
+//! listing before found, takes its turn with `MKD`, and claims it with
+//! `RNFR` and `RNTO` to a name recording the node and the time. Several
+//! nodes may poll one directory; whichever rename succeeds has the file.
+//! `Accepted` deletes the claimed file; `Refused` and `Failed` rename it
+//! back under its dropped name, never over a file dropped there since.
 //!
 //! The origin URI carries what the server knew: `ftp://server/orders/1.edi`.
 
 pub mod client;
 pub mod control;
+pub mod listing;
+mod loopback;
 pub mod reply;
+#[cfg(feature = "tls")]
+pub mod secure;
+pub mod serving;
 pub mod session;
+pub mod store;
+pub mod wire;
 
 use std::net::TcpListener;
 use std::time::Duration;
@@ -33,15 +48,16 @@ pub use client::{Client, anonymous};
 pub use control::Control;
 use net::Target;
 pub use reply::Reply;
+#[cfg(feature = "tls")]
+pub use secure::Secured;
+pub use serving::{Guard, serving};
 pub use session::{Event, Session};
-use transport::ArrivalIdentity;
-use transport::error::{Result, protocol_error};
-use transport::listening::{Accepting, Listening};
-use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
+pub use store::Store;
+use transport::claim::{Claimant, Claiming, Held, Site, Sited};
+use transport::error::Result;
 use transport::socket;
-use transport::taken::Taken;
 use transport::{
-    Arrived, Configured, Directions, Login, NoNativeClaim, Pool, Refused, ResourceClaim, Transport,
+    Arrived, Configured, Directions, Login, NodeLocation, Pool, ResourceClaim, Transport,
 };
 use xcore::settings::{Applies, Fixed, Kind, Presence, Setting, Settings};
 
@@ -58,9 +74,12 @@ pub struct FtpTransport {
     /// logged in once per server and kept, shared with what a receive
     /// handed back until each is acknowledged.
     controls: Pool<Control>,
-    /// The files refused and left, not listed again while unchanged.
-    /// Cloned, the same memory.
-    refused: Refused<String, String>,
+    /// The claims made here, the stability check's memory, the refused
+    /// files and those waiting to go back. Cloned, the same memory.
+    claiming: Claiming<listing::Stamp>,
+    /// FTPS, where given.
+    #[cfg(feature = "tls")]
+    secured: Option<Secured>,
 }
 
 impl FtpTransport {
@@ -73,8 +92,26 @@ impl FtpTransport {
             delete_after_retrieve: DELETE_AFTER_RETRIEVE,
             timeout: None,
             controls: Pool::new(),
-            refused: Refused::default(),
+            claiming: Claiming::new(Claimant::process()),
+            #[cfg(feature = "tls")]
+            secured: None,
         }
+    }
+
+    /// Speak FTPS: `AUTH TLS` on the control connection and `PROT P` on
+    /// every transfer, the server's certificate checked as `secured` says.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn secured(mut self, secured: Secured) -> Self {
+        self.secured = Some(secured);
+        self
+    }
+
+    /// The claimed files this Location could not return yet: each by its
+    /// claimed name, and why. Each goes back as soon as its name is free.
+    #[must_use]
+    pub fn held(&self) -> Vec<Held> {
+        self.claiming.held()
     }
 
     /// Log in as this.
@@ -103,7 +140,16 @@ impl FtpTransport {
     /// # Errors
     /// Where the server could not be reached or refused the login.
     pub fn connect(&self) -> Result<Client> {
-        Client::connect(&self.server, &self.login, self.timeout)
+        self.connect_to(&self.server)
+    }
+
+    /// Connect to `server` and log in, as FTPS where this transport speaks it.
+    fn connect_to(&self, server: &str) -> Result<Client> {
+        #[cfg(feature = "tls")]
+        if let Some(secured) = &self.secured {
+            return Client::connect_secured(server, &self.login, self.timeout, secured);
+        }
+        Client::connect(server, &self.login, self.timeout)
     }
 
     /// Bind as the far end clients connect to, and report the address.
@@ -148,29 +194,31 @@ impl Transport for FtpTransport {
         transport::Waiting::Polled("a receive lists the directory and returns")
     }
 
-    /// Every file in the directory, listed on the control connection kept
-    /// for the server, logged in on the first receive, and handed back
-    /// unread, but those refused and still as they were refused — each
-    /// stamped (`SIZE`, `MDTM`) only where it was refused. Each body is its
-    /// `RETR`, read as the runtime asks, and its server's completion;
-    /// `Accepted` deletes the file (`DELE`) unless the transport was told
-    /// to leave files, `Refused` leaves it and remembers it, `Failed`
-    /// leaves it for the next receive.
+    /// Every file in the directory that is finished, not refused as it
+    /// lies, and won — listed and claimed on the control connection kept
+    /// for the server, logged in on the first receive — handed back unread.
+    /// Each body is the claimed file's `RETR`, read as the runtime asks, and
+    /// its server's completion; `Accepted` deletes it (`DELE`) unless the
+    /// transport was told to leave files, when it goes back like the rest:
+    /// `Refused` renames it back and remembers it, `Failed` renames it back
+    /// for the next receive.
     fn receive(&self) -> Result<Vec<Arrived>> {
         self.controls.exchange(
             self.server.as_str(),
             || self.connect().map(Control::new),
             |control| {
-                let names = control.with(Client::names)?;
-                let stamp = |name: &String| control.with(|client| client.stamp(name)).ok()?;
                 Ok(self
-                    .refused
-                    .sift(names, |name| name, stamp)
+                    .claiming
+                    .take(&*control)?
                     .into_iter()
-                    .map(|name| {
-                        let origin = format!("ftp://{}/{name}", self.server);
-                        let refused = self.refused.clone();
-                        control.arrival(origin, name, self.delete_after_retrieve, refused)
+                    .map(|taken| {
+                        let origin = format!("ftp://{}/{}", self.server, taken.dropped);
+                        let told = self.claiming.acknowledgement(
+                            control.clone(),
+                            taken.claimed.clone(),
+                            self.delete_after_retrieve,
+                        );
+                        control.arrival(origin, taken.claimed, told)
                     })
                     .collect())
             },
@@ -183,13 +231,34 @@ impl Transport for FtpTransport {
         let (server, name) = self.resolve(target);
         self.controls.exchange(
             server,
-            || Client::connect(server, &self.login, self.timeout).map(Control::new),
+            || self.connect_to(server).map(Control::new),
             |control| control.with(|client| client.store(name, bytes)),
         )
     }
 
+    /// The file family's claim, in FTP's words (ADR-0024, amendment
+    /// 2026-10-13).
     fn claims(&self) -> Option<&dyn ResourceClaim> {
-        Some(&NoNativeClaim)
+        Some(self)
+    }
+}
+
+impl Sited for FtpTransport {
+    type Stamp = listing::Stamp;
+
+    fn claiming(&self) -> &Claiming<listing::Stamp> {
+        &self.claiming
+    }
+
+    fn with_site<T>(
+        &self,
+        act: &mut dyn FnMut(Site<'_, listing::Stamp>) -> Result<T>,
+    ) -> Result<T> {
+        self.controls.exchange(
+            self.server.as_str(),
+            || self.connect().map(Control::new),
+            |control| act(&*control),
+        )
     }
 }
 
@@ -220,13 +289,33 @@ impl Configured for FtpTransport {
                           when left out.",
                 applies: Applies::Both,
             },
+            Setting {
+                name: "tls",
+                kind: Kind::Boolean,
+                presence: Presence::Default(Fixed::Boolean(false)),
+                meaning: "FTPS: AUTH TLS on the control connection and PROT P on every \
+                          transfer (RFC 4217), the server's certificate checked against the \
+                          operating system's trust store.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "tls_name",
+                kind: Kind::Text,
+                presence: Presence::Optional,
+                meaning: "The name the server's certificate is checked for; the address's \
+                          host when left out.",
+                applies: Applies::Both,
+            },
         ],
     };
 
     /// A named user's password comes through the Location's credentials,
     /// never a setting; the login is built without it.
     fn configured(address: &str, settings: &xcore::settings::Read) -> Result<Self> {
-        let mut transport = Self::new(address);
+        let mut transport = Self::new(address).guarded_as(
+            settings.optional_boolean("tls") == Some(true),
+            settings.optional_text("tls_name"),
+        )?;
         if let Some(user) = settings.optional_text("user") {
             transport = transport.logging_in(Login::new(user, ""));
         }
@@ -238,51 +327,58 @@ impl Configured for FtpTransport {
         }
         Ok(transport)
     }
+
+    /// Claims made in `node`'s name from here on; what that name still
+    /// holds on the server is returned by the first receive that reaches
+    /// it (ADR-0024, amendment 2026-10-13).
+    fn on_node(mut self, node: &NodeLocation) -> Result<Self> {
+        self.claiming = Claiming::recovering(Claimant::of(node));
+        Ok(self)
+    }
 }
 
 impl FtpTransport {
-    /// Both ends on this machine: an ephemeral local port, an anonymous
-    /// login, the loopback timeout on every read.
-    #[must_use]
-    pub fn loopback() -> Self {
-        Self::new("127.0.0.1:0").timing_out_after(LOOPBACK_TIMEOUT)
-    }
-}
-
-impl Accepting for FtpTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
-        // The client keeps its control connection for the next store.
-        self.accept_one(listener)?
-            .next_store()?
-            .ok_or_else(|| protocol_error("the client quit without storing"))
-    }
-}
-
-impl Loopback for FtpTransport {
-    fn arrival_identity(&self) -> ArrivalIdentity {
-        ArrivalIdentity::Unnamed(
-            "a file names no sender: the share it was taken from is in its origin",
-        )
+    /// FTPS where `tls` says, checked for `name` where one is given.
+    #[cfg(feature = "tls")]
+    #[allow(clippy::unnecessary_wraps)]
+    fn guarded_as(self, tls: bool, name: Option<&str>) -> Result<Self> {
+        if !tls {
+            return Ok(self);
+        }
+        let secured = name.map_or_else(Secured::native, |name| Secured::native().named(name));
+        Ok(self.secured(secured))
     }
 
-    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
-    }
-
-    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
-        Self::new(address)
-            .timing_out_after(LOOPBACK_TIMEOUT)
-            .send("probe.bin", payload)
+    /// Plain FTP; `tls` refused, since this build carries no TLS.
+    #[cfg(not(feature = "tls"))]
+    fn guarded_as(self, tls: bool, _name: Option<&str>) -> Result<Self> {
+        if tls {
+            return Err(transport::TransportError::permanent(
+                "FTPS needs the ftp transport built with its tls feature",
+            ));
+        }
+        Ok(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::loopback::Loopback;
     use transport::payload::edge_payloads;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    /// What two listings take: a file is taken by the listing after the
+    /// one that found it unchanged.
+    fn settled(near: &FtpTransport) -> Result<Vec<Arrived>> {
+        let first = near.receive()?;
+        if !first.is_empty() {
+            return Ok(first);
+        }
+        near.receive()
     }
 
     #[test]
@@ -342,9 +438,9 @@ mod tests {
         let (listener, address) = far_end.bind().expect("binding");
         let sender = std::thread::spawn(move || {
             let near = FtpTransport::new(address.clone()).timing_out_after(secs(2));
-            near.send("orders/1.edi", b"UNA:+.? '")?;
+            near.send("1.edi", b"UNA:+.? '")?;
             near.send(&format!("ftp://{address}/2.edi"), b"")?;
-            let mut arrived = near.receive()?;
+            let mut arrived = settled(&near)?;
             arrived.sort_by(|a, b| a.origin_uri.cmp(&b.origin_uri));
             arrived
                 .into_iter()
@@ -356,7 +452,7 @@ mod tests {
         let mut session = far_end.accept_one(&listener).expect("accepting");
         let first = session.next_store().expect("first").expect("one");
         assert_eq!(first.bytes, b"UNA:+.? '");
-        assert!(first.origin_uri.ends_with("/orders/1.edi"));
+        assert!(first.origin_uri.ends_with("/1.edi"));
         let second = session.next_store().expect("second").expect("one");
         assert!(second.bytes.is_empty());
         let mut events = Vec::new();
@@ -366,9 +462,9 @@ mod tests {
         assert_eq!(events.len(), 4, "two retrieves and two deletes: {events:?}");
         let arrived = sender.join().expect("thread").expect("round trip");
         assert_eq!(arrived.len(), 2);
-        assert_eq!(arrived[0].bytes, b"");
-        assert!(arrived[0].origin_uri.ends_with("/2.edi"));
-        assert_eq!(arrived[1].bytes, b"UNA:+.? '");
+        assert_eq!(arrived[0].bytes, b"UNA:+.? '");
+        assert_eq!(arrived[1].bytes, b"");
+        assert!(arrived[1].origin_uri.ends_with("/2.edi"));
         assert!(session.files().is_empty(), "deleted after retrieve");
     }
 
@@ -378,14 +474,14 @@ mod tests {
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
             let near = FtpTransport::new(address).timing_out_after(secs(2));
-            let first = transport::arrived::one_arrival(near.receive()?, "listed")?;
+            let first = transport::arrived::one_arrival(settled(&near)?, "listed")?;
             assert!(first.defers());
             let (_, mut body, acknowledgement) = first.into_parts();
             let mut read = Vec::new();
             std::io::Read::read_to_end(&mut body, &mut read).expect("reading");
             drop(body);
             acknowledgement.acknowledge(transport::Verdict::Failed)?;
-            let again = transport::arrived::one_arrival(near.receive()?, "listed again")?;
+            let again = transport::arrived::one_arrival(settled(&near)?, "listed again")?;
             Ok::<_, transport::TransportError>((read, again.taken()?))
         });
         let files = std::collections::BTreeMap::from([("1.edi".to_string(), b"UNB".to_vec())]);
@@ -402,15 +498,14 @@ mod tests {
             (read.as_slice(), taken.bytes.as_slice()),
             (&b"UNB"[..], &b"UNB"[..])
         );
-        let one = "1.edi".to_string();
-        assert_eq!(
-            events,
-            [
-                Event::Retrieved(one.clone()),
-                Event::Retrieved(one.clone()),
-                Event::Deleted(one)
-            ],
-            "the failed retrieve deleted nothing"
+        let claimed = |name: &String| name.starts_with("1.edi.xmip-claim.");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::Retrieved(a), Event::Retrieved(b), Event::Deleted(c)]
+                    if claimed(a) && claimed(b) && b == c
+            ),
+            "the failed retrieve deleted nothing, each read claimed: {events:?}"
         );
         assert!(session.files().is_empty(), "deleted once accepted");
     }
@@ -421,11 +516,11 @@ mod tests {
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
             let near = FtpTransport::new(address).timing_out_after(secs(2));
-            let first = transport::arrived::one_arrival(near.receive()?, "listed")?;
+            let first = transport::arrived::one_arrival(settled(&near)?, "listed")?;
             first.refused(transport::Refusal::Unacceptable)?;
-            let unchanged = near.receive()?.len();
+            let unchanged = near.receive()?.len() + near.receive()?.len();
             near.send("1.edi", b"UNB again")?;
-            let again = transport::arrived::one_arrival(near.receive()?, "stored again")?;
+            let again = transport::arrived::one_arrival(settled(&near)?, "stored again")?;
             again.refused(transport::Refusal::Unacceptable)?;
             Ok::<_, transport::TransportError>(unchanged)
         });
