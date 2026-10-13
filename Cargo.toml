@@ -24,11 +24,23 @@ net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
+# Optional, and only for `tls`: FTPS (RFC 4217) over the estate's TLS
+# (ADR-0033), so a forwarder on an edge device carries no TLS stack it does
+# not speak.
+tls = { package = "xmip-core-library-tls", git = "https://github.com/IlleNilsson/xmip-core-library-tls", branch = "main", optional = true }
+
+[features]
+# FTPS: AUTH TLS on the control connection, PROT P on every transfer.
+tls = ["dep:tls", "transport/tls"]
 
 [dev-dependencies]
 # The loopback payloads the tests drive, from the capability's test
 # support and never a production build (ADR-0044).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main", features = ["test-support"] }
+# A certificate for the FTPS tests, signed by the estate's own provisioning
+# (dogfooding: the node's self-signed source, not a third party's).
+provision = { package = "xmip-core-provision", git = "https://github.com/IlleNilsson/xmip-core-provision", branch = "main" }
+provision_self_signed = { package = "xmip-core-provision-self-signed", git = "https://github.com/IlleNilsson/xmip-core-provision-self-signed", branch = "main" }
 
 [lints.rust]
 unsafe_code = "forbid"
