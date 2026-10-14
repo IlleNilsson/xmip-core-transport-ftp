@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(first.bytes, b"UNA:+.? '");
         assert!(first.origin_uri.ends_with("/1.edi"));
         let second = session.next_store().expect("second").expect("one");
-        assert!(second.bytes.is_empty());
+        assert_eq!(second.bytes, [] as [u8; 0]);
         let mut events = Vec::new();
         while let Some(event) = session.next_event().expect("serving") {
             events.push(event);
