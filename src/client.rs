@@ -144,14 +144,14 @@ impl Client {
         }
     }
 
-    /// Store `bytes` as `name` in the current directory.
+    /// Store `outgoing`'s body as `name` in the current directory, written
+    /// to the data connection as it is read, never whole in memory.
     ///
     /// # Errors
     /// Where the server refused the store or the data connection broke.
-    pub fn store(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+    pub fn store(&mut self, name: &str, outgoing: &transport::Outgoing<'_>) -> Result<()> {
         let mut data = self.opened(&format!("STOR {name}"), "the store")?;
-        data.write_all(bytes)
-            .map_err(|e| classify("writing the data", &e))?;
+        outgoing.write_to(&mut data)?;
         data.finish()?;
         self.completion("the store")
     }

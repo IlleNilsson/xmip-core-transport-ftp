@@ -2,7 +2,7 @@
 
 FTP transport: one file is one Stream, its name beside it; a Location lists, claims and retrieves, or stores, in passive binary mode, or serves clients directly. RFC 959; FTPS (RFC 4217) behind the `tls` feature. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
-A Send Location stores on a control connection logged in once per server and kept (`transport::Pool`); the data connection is each transfer's own, which is how stream mode ends a file. The login is the transport capability's `Login`, `anonymous()` unless a user is named. Until 2026-09-27 every store logged in and quit.
+A Send Location stores on a control connection logged in once per server and kept (`transport::Pool`); the data connection is each transfer's own, which is how stream mode ends a file. The login is the transport capability's `Login`, `anonymous()` unless a user is named. Until 2026-09-27 every store logged in and quit. A store writes the Message to its data connection as it is read from the Ledger, a piece at a time, never whole in memory (`Sending::Streamed`, 2026-10-19), and a receive claims no more files of a listing than the runtime has room for, the rest left for the next listing.
 
 A Receive Location lists, claims, retrieves and deletes on the same kept control connection. Until 2026-09-28 every receive logged in and quit.
 

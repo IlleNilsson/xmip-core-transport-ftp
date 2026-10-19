@@ -202,14 +202,14 @@ impl Transport for FtpTransport {
     /// transport was told to leave files, when it goes back like the rest:
     /// `Refused` renames it back and remembers it, `Failed` renames it back
     /// for the next receive.
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         self.controls.exchange(
             self.server.as_str(),
             || self.connect().map(Control::new),
             |control| {
                 Ok(self
                     .claiming
-                    .take(&*control)?
+                    .take(&*control, most)?
                     .into_iter()
                     .map(|taken| {
                         let origin = format!("ftp://{}/{}", self.server, taken.dropped);
@@ -225,14 +225,18 @@ impl Transport for FtpTransport {
         )
     }
 
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Streamed("the data connection carries the body as it is read")
+    }
+
     /// STOR on the control connection kept for the server, logged in on
     /// the first send to it; the data connection is the transfer's own.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
         let (server, name) = self.resolve(target);
         self.controls.exchange(
             server,
             || self.connect_to(server).map(Control::new),
-            |control| control.with(|client| client.store(name, bytes)),
+            |control| control.with(|client| client.store(name, &outgoing)),
         )
     }
 
