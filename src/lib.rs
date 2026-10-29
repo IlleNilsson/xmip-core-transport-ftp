@@ -15,7 +15,7 @@
 //! firewall lets through — and, behind the `tls` feature, FTPS: RFC 4217's
 //! `AUTH TLS` and `PROT P` over the estate's TLS (`xmip-core-library-tls`,
 //! ADR-0033), the control connection and every data connection guarded
-//! ([`FtpTransport::secured`], the `tls` setting).
+//! ([`FtpTransport::secured`], an `ftps://` address).
 //!
 //! **A file is taken once it is finished, and by one node** (ADR-0024,
 //! amendment 2026-10-13): the file family's claim, written once in the
@@ -59,16 +59,18 @@ use transport::socket;
 use transport::{
     Arrived, Configured, Directions, Login, NodeLocation, Pool, ResourceClaim, Transport,
 };
-use xcore::settings::{Applies, Fixed, Kind, Presence, Setting, Settings};
+use xcore::settings::{Applies, Kind, Presence, Setting, Settings};
 
-/// Whether an accepted file is deleted, unless a Location says.
-pub const DELETE_AFTER_RETRIEVE: bool = true;
+/// The control port an address that names none is reached on, FTPS as FTP
+/// (RFC 959, RFC 4217).
+pub const PORT: u16 = 21;
 
 #[derive(Clone)]
 pub struct FtpTransport {
     server: String,
     login: Login,
-    delete_after_retrieve: bool,
+    /// The directory it lists and stores in, where the address names one.
+    directory: Option<String>,
     timeout: Option<Duration>,
     /// The control connections a send stores on and a receive retrieves on,
     /// logged in once per server and kept, shared with what a receive
@@ -89,7 +91,7 @@ impl FtpTransport {
         Self {
             server: server.into(),
             login: anonymous(),
-            delete_after_retrieve: DELETE_AFTER_RETRIEVE,
+            directory: None,
             timeout: None,
             controls: Pool::new(),
             claiming: Claiming::new(Claimant::process()),
@@ -121,10 +123,10 @@ impl FtpTransport {
         self
     }
 
-    /// Leave accepted files in place rather than deleting them.
+    /// List and store in `directory` rather than where the login lands.
     #[must_use]
-    pub const fn leaving_files(mut self) -> Self {
-        self.delete_after_retrieve = false;
+    pub fn in_directory(mut self, directory: impl Into<String>) -> Self {
+        self.directory = Some(directory.into());
         self
     }
 
@@ -143,13 +145,21 @@ impl FtpTransport {
         self.connect_to(&self.server)
     }
 
-    /// Connect to `server` and log in, as FTPS where this transport speaks it.
+    /// Connect to `server` and log in, as FTPS where this transport speaks it,
+    /// in the directory its address names where `server` is its own.
     fn connect_to(&self, server: &str) -> Result<Client> {
         #[cfg(feature = "tls")]
-        if let Some(secured) = &self.secured {
-            return Client::connect_secured(server, &self.login, self.timeout, secured);
+        let connected = match &self.secured {
+            Some(secured) => Client::connect_secured(server, &self.login, self.timeout, secured),
+            None => Client::connect(server, &self.login, self.timeout),
+        };
+        #[cfg(not(feature = "tls"))]
+        let connected = Client::connect(server, &self.login, self.timeout);
+        let mut client = connected?;
+        if let Some(directory) = self.directory.as_deref().filter(|_| server == self.server) {
+            client.change_directory(directory)?;
         }
-        Client::connect(server, &self.login, self.timeout)
+        Ok(client)
     }
 
     /// Bind as the far end clients connect to, and report the address.
@@ -170,9 +180,10 @@ impl FtpTransport {
 
     /// Where a target names the server and file itself — `ftp://host/name`
     /// — or is a name alone on this transport's server.
-    fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        Target::under(&["ftp"], target).map_or((&self.server, target), |named| {
-            (named.authority(), named.path())
+    fn resolve<'a>(&'a self, target: &'a str) -> (String, &'a str) {
+        Target::under(Self::SCHEMES, target).map_or((self.server.clone(), target), |named| {
+            let server = net::authority::with_default_port(named.authority(), PORT);
+            (server, named.path())
         })
     }
 }
@@ -198,10 +209,9 @@ impl Transport for FtpTransport {
     /// lies, and won — listed and claimed on the control connection kept
     /// for the server, logged in on the first receive — handed back unread.
     /// Each body is the claimed file's `RETR`, read as the runtime asks, and
-    /// its server's completion; `Accepted` deletes it (`DELE`) unless the
-    /// transport was told to leave files, when it goes back like the rest:
-    /// `Refused` renames it back and remembers it, `Failed` renames it back
-    /// for the next receive.
+    /// its server's completion. The verdict decides what becomes of it:
+    /// `Accepted` deletes it (`DELE`), `Refused` renames it back and
+    /// remembers it, `Failed` renames it back for the next receive.
     fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         self.controls.exchange(
             self.server.as_str(),
@@ -212,12 +222,15 @@ impl Transport for FtpTransport {
                     .take(&*control, most)?
                     .into_iter()
                     .map(|taken| {
-                        let origin = format!("ftp://{}/{}", self.server, taken.dropped);
-                        let told = self.claiming.acknowledgement(
-                            control.clone(),
-                            taken.claimed.clone(),
-                            self.delete_after_retrieve,
-                        );
+                        let origin = match &self.directory {
+                            Some(directory) => {
+                                format!("ftp://{}/{directory}/{}", self.server, taken.dropped)
+                            }
+                            None => format!("ftp://{}/{}", self.server, taken.dropped),
+                        };
+                        let told = self
+                            .claiming
+                            .acknowledgement(control.clone(), taken.claimed.clone());
                         control.arrival(origin, taken.claimed, told)
                     })
                     .collect())
@@ -232,10 +245,12 @@ impl Transport for FtpTransport {
     /// STOR on the control connection kept for the server, logged in on
     /// the first send to it; the data connection is the transfer's own.
     fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
-        let (server, name) = self.resolve(target);
+        let (server, given) = self.resolve(target);
+        let given = given.rsplit('/').next().unwrap_or(given);
+        let name = &transport::file_name::file_name(&outgoing, None, given, &server)?;
         self.controls.exchange(
-            server,
-            || self.connect_to(server).map(Control::new),
+            server.as_str(),
+            || self.connect_to(&server).map(Control::new),
             |control| control.with(|client| client.store(name, &outgoing)),
         )
     }
@@ -267,24 +282,14 @@ impl Sited for FtpTransport {
 }
 
 impl Configured for FtpTransport {
-    /// The address is the server's host and port: where a Location logs in.
+    /// The address is the server, the user and the directory,
+    /// `ftp://user@host:21/dir`, or `host:21` alone: where a Location logs
+    /// in, as whom — anonymous where it names no one — and where it lists
+    /// and stores. `ftps://` is FTPS: `AUTH TLS` on the control connection
+    /// and `PROT P` on every transfer (RFC 4217).
     const SETTINGS: &'static Settings = &Settings {
         technology: env!("CARGO_PKG_NAME"),
         settings: &[
-            Setting {
-                name: "user",
-                kind: Kind::Text,
-                presence: Presence::Optional,
-                meaning: "The user a Location logs in as; anonymous when left out.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "delete_after_retrieve",
-                kind: Kind::Boolean,
-                presence: Presence::Default(Fixed::Boolean(DELETE_AFTER_RETRIEVE)),
-                meaning: "Whether a file is deleted once its receive cycle accepted it.",
-                applies: Applies::Receive,
-            },
             Setting {
                 name: "timeout",
                 kind: Kind::Duration,
@@ -294,37 +299,42 @@ impl Configured for FtpTransport {
                 applies: Applies::Both,
             },
             Setting {
-                name: "tls",
-                kind: Kind::Boolean,
-                presence: Presence::Default(Fixed::Boolean(false)),
-                meaning: "FTPS: AUTH TLS on the control connection and PROT P on every \
-                          transfer (RFC 4217), the server's certificate checked against the \
-                          operating system's trust store.",
-                applies: Applies::Both,
-            },
-            Setting {
                 name: "tls_name",
                 kind: Kind::Text,
                 presence: Presence::Optional,
-                meaning: "The name the server's certificate is checked for; the address's \
-                          host when left out.",
+                meaning: "The name an ftps:// server's certificate is checked for; the \
+                          address's host when left out.",
                 applies: Applies::Both,
             },
         ],
     };
 
+    const SCHEMES: &'static [&'static str] = &["ftp", "ftps"];
+
+    /// The whole address: its scheme says FTPS, its user part who logs in.
+    fn own_terms(address: &str) -> &str {
+        address
+    }
+
     /// A named user's password comes through the Location's credentials,
     /// never a setting; the login is built without it.
     fn configured(address: &str, settings: &xcore::settings::Read) -> Result<Self> {
-        let mut transport = Self::new(address).guarded_as(
-            settings.optional_boolean("tls") == Some(true),
-            settings.optional_text("tls_name"),
-        )?;
-        if let Some(user) = settings.optional_text("user") {
+        let named = Target::under(Self::SCHEMES, address);
+        let server = net::authority::with_default_port(
+            named.map_or(address, |named| named.authority()),
+            PORT,
+        );
+        let secure = named.is_some_and(|named| named.is(&["ftps"]));
+        let mut transport =
+            Self::new(server).guarded_as(secure, settings.optional_text("tls_name"))?;
+        if let Some(user) = named.and_then(|named| named.user()) {
             transport = transport.logging_in(Login::new(user, ""));
         }
-        if settings.optional_boolean("delete_after_retrieve") == Some(false) {
-            transport = transport.leaving_files();
+        if let Some(directory) = named
+            .map(|named| named.path())
+            .filter(|path| !path.is_empty())
+        {
+            transport = transport.in_directory(directory);
         }
         if let Some(timeout) = settings.optional_duration("timeout") {
             transport = transport.timing_out_after(timeout);
@@ -342,7 +352,8 @@ impl Configured for FtpTransport {
 }
 
 impl FtpTransport {
-    /// FTPS where `tls` says, checked for `name` where one is given.
+    /// FTPS where the address is `ftps://`, checked for `name` where one
+    /// is given.
     #[cfg(feature = "tls")]
     #[allow(clippy::unnecessary_wraps)]
     fn guarded_as(self, tls: bool, name: Option<&str>) -> Result<Self> {
@@ -353,7 +364,7 @@ impl FtpTransport {
         Ok(self.secured(secured))
     }
 
-    /// Plain FTP; `tls` refused, since this build carries no TLS.
+    /// Plain FTP; `ftps://` refused, since this build carries no TLS.
     #[cfg(not(feature = "tls"))]
     fn guarded_as(self, tls: bool, _name: Option<&str>) -> Result<Self> {
         if tls {
@@ -389,25 +400,34 @@ mod tests {
     fn ftp_declares_its_settings_and_reads_through_them() {
         use xcore::settings::Given;
         assert_eq!(FtpTransport::SETTINGS.problems(), Vec::<String>::new());
-        let given = [
-            ("user".to_string(), Given::Text("party".to_string())),
-            ("delete_after_retrieve".to_string(), Given::Boolean(false)),
-            ("timeout".to_string(), Given::Text("30s".to_string())),
-        ];
-        let built = FtpTransport::open("ftp.example:21", Applies::Receive, &given).expect("built");
+        let given = [("timeout".to_string(), Given::Text("30s".to_string()))];
+        let built = FtpTransport::open("ftp://party@ftp.example:21/in", Applies::Receive, &given)
+            .expect("built");
+        assert_eq!(built.server, "ftp.example:21");
         assert_eq!(built.login.user, "party");
-        assert!(!built.delete_after_retrieve);
+        assert_eq!(built.directory.as_deref(), Some("in"));
         assert_eq!(built.timeout, Some(secs(30)));
         let plain = FtpTransport::open("ftp.example:21", Applies::Send, &[]).expect("plain");
         assert_eq!(plain.login.user, "anonymous");
-        let Err(refused) = FtpTransport::open("ftp.example:21", Applies::Send, &given[1..2]) else {
-            panic!("a Send Location deletes nothing");
-        };
-        assert!(
-            refused.message.contains("\"delete_after_retrieve\""),
-            "{}",
-            refused.message
-        );
+        assert_eq!(plain.directory, None);
+        for gone in ["user", "tls", "delete_after_retrieve"] {
+            let setting = [(gone.to_string(), Given::Text("x".to_string()))];
+            let Err(refused) = FtpTransport::open("ftp.example:21", Applies::Receive, &setting)
+            else {
+                panic!("{gone} is the address's, or the verdict's");
+            };
+            assert!(refused.message.contains(gone), "{}", refused.message);
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn an_ftps_address_is_ftps_and_an_ftp_one_is_not() {
+        let secure = FtpTransport::open("ftps://ftp.example", Applies::Send, &[]).expect("ftps");
+        assert!(secure.secured.is_some());
+        assert_eq!(secure.server, "ftp.example:21");
+        let plain = FtpTransport::open("FTP://ftp.example", Applies::Send, &[]).expect("ftp");
+        assert!(plain.secured.is_none());
     }
 
     #[test]
