@@ -134,6 +134,14 @@ impl Client {
         reply::read(&mut self.line.reader)
     }
 
+    /// Change to `directory` (`CWD`), where a Location's address names one.
+    ///
+    /// # Errors
+    /// Where the server refused the directory or the connection broke.
+    pub fn change_directory(&mut self, directory: &str) -> Result<()> {
+        self.completed(&format!("CWD {directory}"), "the directory")
+    }
+
     /// Send `command` and hold its reply to a completion.
     fn completed(&mut self, command: &str, what: &str) -> Result<()> {
         let reply = self.command(command)?;
