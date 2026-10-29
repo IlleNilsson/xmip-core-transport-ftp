@@ -69,6 +69,9 @@ pub const PORT: u16 = 21;
 pub struct FtpTransport {
     server: String,
     login: Login,
+    /// The secret its Location names, whose password the login presents,
+    /// read at each login (ADR-0019, amendment 2026-10-29).
+    secret: Option<transport::Secured>,
     /// The directory it lists and stores in, where the address names one.
     directory: Option<String>,
     timeout: Option<Duration>,
@@ -91,6 +94,7 @@ impl FtpTransport {
         Self {
             server: server.into(),
             login: anonymous(),
+            secret: None,
             directory: None,
             timeout: None,
             controls: Pool::new(),
@@ -148,13 +152,14 @@ impl FtpTransport {
     /// Connect to `server` and log in, as FTPS where this transport speaks it,
     /// in the directory its address names where `server` is its own.
     fn connect_to(&self, server: &str) -> Result<Client> {
+        let login = &transport::secured::logged_in(&self.login, self.secret.as_ref(), "ftp")?;
         #[cfg(feature = "tls")]
         let connected = match &self.secured {
-            Some(secured) => Client::connect_secured(server, &self.login, self.timeout, secured),
-            None => Client::connect(server, &self.login, self.timeout),
+            Some(secured) => Client::connect_secured(server, login, self.timeout, secured),
+            None => Client::connect(server, login, self.timeout),
         };
         #[cfg(not(feature = "tls"))]
-        let connected = Client::connect(server, &self.login, self.timeout);
+        let connected = Client::connect(server, login, self.timeout);
         let mut client = connected?;
         if let Some(directory) = self.directory.as_deref().filter(|_| server == self.server) {
             client.change_directory(directory)?;
@@ -316,8 +321,8 @@ impl Configured for FtpTransport {
         address
     }
 
-    /// A named user's password comes through the Location's credentials,
-    /// never a setting; the login is built without it.
+    /// A named user's password is the secret the Location names, never a
+    /// setting; the login is built without it.
     fn configured(address: &str, settings: &xcore::settings::Read) -> Result<Self> {
         let named = Target::under(Self::SCHEMES, address);
         let server = net::authority::with_default_port(
@@ -347,6 +352,12 @@ impl Configured for FtpTransport {
     /// it (ADR-0024, amendment 2026-10-13).
     fn on_node(mut self, node: &NodeLocation) -> Result<Self> {
         self.claiming = Claiming::recovering(Claimant::of(node));
+        Ok(self)
+    }
+
+    /// The password the Location's secret holds, read at each login.
+    fn secured_by(mut self, secret: transport::Secured) -> Result<Self> {
+        self.secret = Some(secret);
         Ok(self)
     }
 }
@@ -664,5 +675,53 @@ mod tests {
         };
         assert!(!error.retryable, "{error}");
         assert!(FtpTransport::new("127.0.0.1:0").claims().is_some());
+    }
+
+    #[test]
+    fn the_password_is_the_locations_secret_read_at_each_login() {
+        use transport::secured::Kept;
+        let kept = std::sync::Arc::new(Kept::default());
+        let near = FtpTransport::new("127.0.0.1:9")
+            .logging_in(Login::new("party", ""))
+            .secured_by(kept.secured("partner-x.ftp"))
+            .expect("kept");
+        let refused = near.connect().err().expect("not set");
+        assert!(
+            refused.message.contains("'partner-x.ftp' is not set"),
+            "{refused}"
+        );
+        assert!(!refused.retryable);
+
+        kept.set(
+            "partner-x.ftp",
+            xcore::SecretKind::Key,
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+        );
+        let wrong = near.connect().err().expect("a key");
+        assert!(
+            wrong
+                .message
+                .contains("is a key, and ftp presents a password"),
+            "{wrong}"
+        );
+
+        kept.set("partner-x.ftp", xcore::SecretKind::Password, &Kept::drawn());
+        let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let secured = kept.secured("partner-x.ftp");
+        let sender = std::thread::spawn(move || {
+            let near = FtpTransport::new(address)
+                .logging_in(Login::new("party", ""))
+                .timing_out_after(secs(2))
+                .secured_by(secured)?;
+            transport::Transport::send(&near, "in.edi", b"UNA")
+        });
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let stored = session.next_store().expect("stored").expect("one");
+        assert_eq!(stored.bytes, b"UNA");
+        sender
+            .join()
+            .expect("thread")
+            .expect("logged in and stored");
     }
 }
