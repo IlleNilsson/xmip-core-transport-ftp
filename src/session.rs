@@ -9,15 +9,22 @@
 //! `RETR`, `NLST` and `MLSD`, its length to `SIZE` and its write to `MDTM`
 //! (RFC 3659), and `MKD`, `RMD`, `RNFR`, `RNTO` and `DELE` change it as the
 //! claim needs (ADR-0024, amendment 2026-10-13). Given a certificate it
-//! answers `AUTH TLS`, `PBSZ` and `PROT` (RFC 4217). Users are not checked;
-//! a Location that needs accounts and a file system behind them talks to a
-//! server through [`crate::Client`].
+//! answers `AUTH TLS`, `PBSZ` and `PROT` (RFC 4217). A login is admitted
+//! only where the check the session is handed (`net::login::Check`) admits
+//! the user `USER` named and the password `PASS` gave — it links no
+//! authenticator; the Playground's check is `authenticate/password`'s — and
+//! `anonymous` and `ftp` are refused before any check is asked. Until a
+//! login is admitted every command but `USER`, `PASS`, `AUTH`, `PBSZ`,
+//! `PROT`, `NOOP` and `QUIT` is answered 530. Until 2026-11-01 any
+//! `PASS` was answered 230. A Location that needs accounts and a file system
+//! behind them talks to a server through [`crate::Client`].
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
+use net::login::Check;
 use net::read;
 use transport::error::{Result, classify, protocol_error};
 use transport::socket;
@@ -27,6 +34,10 @@ use crate::listing::written;
 use crate::reply::format;
 use crate::store::Store;
 use crate::wire::{Data, Line};
+
+mod login;
+
+use login::BEFORE_LOGIN;
 
 /// What the client did, as [`Session::next_event`] reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +55,12 @@ pub struct Session {
     peer: SocketAddr,
     timeout: Option<Duration>,
     store: Store,
+    /// What a login is asked of.
+    check: Check,
+    /// The user `USER` named, for the `PASS` after it.
+    user: Option<String>,
+    /// Whether a login was admitted.
+    logged_in: bool,
     passive: Option<TcpListener>,
     /// The name an `RNFR` named, for the `RNTO` after it.
     renaming: Option<String>,
@@ -54,26 +71,36 @@ pub struct Session {
 }
 
 impl Session {
-    /// Accept one client on `listener` and greet it.
+    /// Accept one client on `listener` and greet it, its login admitted
+    /// where `check` admits it.
     ///
     /// # Errors
     /// Where the connection could not be accepted.
-    pub fn accept(listener: &TcpListener, timeout: Option<Duration>) -> Result<Self> {
+    pub fn accept(listener: &TcpListener, timeout: Option<Duration>, check: Check) -> Result<Self> {
         let (stream, peer) = socket::accept_tcp(listener, timeout)?;
-        Self::serving(stream, peer, timeout)
+        Self::serving(stream, peer, timeout, check)
     }
 
-    /// Serve the client `peer` on the accepted `stream`, and greet it.
+    /// Serve the client `peer` on the accepted `stream`, its login
+    /// admitted where `check` admits it, and greet it.
     ///
     /// # Errors
     /// Where the greeting could not be written.
-    pub fn serving(stream: TcpStream, peer: SocketAddr, timeout: Option<Duration>) -> Result<Self> {
+    pub fn serving(
+        stream: TcpStream,
+        peer: SocketAddr,
+        timeout: Option<Duration>,
+        check: Check,
+    ) -> Result<Self> {
         socket::settle(&stream, timeout)?;
         let mut session = Self {
             line: Line::plain(stream)?,
             peer,
             timeout,
             store: Store::default(),
+            check,
+            user: None,
+            logged_in: false,
             passive: None,
             renaming: None,
             #[cfg(feature = "tls")]
@@ -128,7 +155,7 @@ impl Session {
 
     /// The next thing the client did with the directory, or `None` when it
     /// quit. Login, mode, passive and directory commands are answered on
-    /// the way.
+    /// the way; before a login is admitted, only the login's.
     ///
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
@@ -139,9 +166,14 @@ impl Session {
             };
             let (verb, argument) = line.split_once(' ').unwrap_or((&line, ""));
             let argument = argument.to_string();
-            match verb.to_ascii_uppercase().as_str() {
-                "USER" => self.reply(331, "password please")?,
-                "PASS" => self.reply(230, "logged in")?,
+            let verb = verb.to_ascii_uppercase();
+            if !self.logged_in && !BEFORE_LOGIN.contains(&verb.as_str()) {
+                self.reply(530, "log in first")?;
+                continue;
+            }
+            match verb.as_str() {
+                "USER" => self.named(argument)?,
+                "PASS" => self.pass(&argument)?,
                 "TYPE" | "NOOP" => self.reply(200, "ok")?,
                 "CWD" => self.reply(250, "directory changed")?,
                 "PWD" => self.reply(257, "\"/\"")?,

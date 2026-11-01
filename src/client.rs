@@ -17,12 +17,6 @@ use crate::reply::{self, Reply};
 use crate::secure::Secured;
 use crate::wire::{Data, Line};
 
-/// The anonymous login, what a Location presents unless it names a user.
-#[must_use]
-pub fn anonymous() -> Login {
-    Login::new("anonymous", "xmip@")
-}
-
 /// One logged-in control connection, kept between transfers while the
 /// server keeps it open.
 pub struct Client {
@@ -36,12 +30,13 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to `server`, log in, and switch to binary.
+    /// Connect to `server`, log in, and switch to binary. With no `login`
+    /// it presents nothing, which a server that checks who logs in refuses.
     ///
     /// # Errors
     /// Where the server could not be reached, did not greet, or refused the
     /// login.
-    pub fn connect(server: &str, login: &Login, timeout: Option<Duration>) -> Result<Self> {
+    pub fn connect(server: &str, login: Option<&Login>, timeout: Option<Duration>) -> Result<Self> {
         let stream = socket::connect_tcp(server, timeout)?;
         let mut client = Self {
             line: Line::plain(stream)?,
@@ -65,7 +60,7 @@ impl Client {
     #[cfg(feature = "tls")]
     pub fn connect_secured(
         server: &str,
-        login: &Login,
+        login: Option<&Login>,
         timeout: Option<Duration>,
         secured: &Secured,
     ) -> Result<Self> {
@@ -105,7 +100,15 @@ impl Client {
         }
     }
 
-    fn logged_in(&mut self, login: &Login) -> Result<()> {
+    fn logged_in(&mut self, login: Option<&Login>) -> Result<()> {
+        if let Some(login) = login {
+            self.presented(login)?;
+        }
+        self.completed("TYPE I", "binary mode")
+    }
+
+    /// `USER`, and `PASS` where the server asks for one.
+    fn presented(&mut self, login: &Login) -> Result<()> {
         let user = self.command(&format!("USER {}", login.user))?;
         if user.is_intermediate() {
             let pass = self.command(&format!("PASS {}", login.password))?;
@@ -115,7 +118,7 @@ impl Client {
         } else if !user.is_completion() {
             return Err(refused("the user", &user));
         }
-        self.completed("TYPE I", "binary mode")
+        Ok(())
     }
 
     /// Send one command and read its reply.
