@@ -1,7 +1,7 @@
 //! A session's login: `USER` and `PASS` asked of the check the session was
 //! handed, anonymous FTP refused before any check is asked.
 
-use net::login::Offered;
+use net::login::{Offer, Offered};
 use transport::error::Result;
 
 use super::Session;
@@ -32,10 +32,10 @@ impl Session {
         let Some(user) = self.user.take() else {
             return self.reply(503, "USER first");
         };
-        if (self.check)(&Offered {
+        if (self.check)(&Offer::Password(Offered {
             user: &user,
             secret,
-        }) {
+        })) {
             self.logged_in = true;
             self.reply(230, "logged in")
         } else {
