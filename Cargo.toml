@@ -18,9 +18,12 @@ path = "src/lib.rs"
 # (repository-model.md). Standard library otherwise: FTP is a reply code
 # and a line.
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
-# The reply code and the line it opens (`net::reply`, `net::read`), and a
-# data connection read to its end under `net::MAX_BODY`.
+# The reply code and the line it opens (`net::reply`, `net::read`), a
+# data connection read to its end under `net::MAX_BODY`, and the login a
+# session is offered with the check it is handed (`net::login`).
 net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
+# The password the loopback mints for its one login (`codec::random`).
+codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }

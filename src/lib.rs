@@ -9,7 +9,9 @@
 //! file back unread: the runtime reads its transfer as it asks, and the file
 //! is deleted only when the receive cycle accepted it; a Send Location logs
 //! in and stores. Either may instead accept clients directly
-//! through [`Session`], one client's worth of server over one directory.
+//! through [`Session`], one client's worth of server over one directory,
+//! which admits a login only where the check it is handed admits it
+//! (`net::login::Check`) and refuses anonymous FTP.
 //!
 //! What is here is RFC 959 in passive mode and binary type — the shape a
 //! firewall lets through — and, behind the `tls` feature, FTPS: RFC 4217's
@@ -31,6 +33,8 @@
 
 pub mod client;
 pub mod control;
+#[cfg(test)]
+mod fixture;
 pub mod listing;
 mod loopback;
 pub mod reply;
@@ -44,9 +48,10 @@ pub mod wire;
 use std::net::TcpListener;
 use std::time::Duration;
 
-pub use client::{Client, anonymous};
+pub use client::Client;
 pub use control::Control;
 use net::Target;
+use net::login::Check;
 pub use reply::Reply;
 #[cfg(feature = "tls")]
 pub use secure::Secured;
@@ -68,7 +73,9 @@ pub const PORT: u16 = 21;
 #[derive(Clone)]
 pub struct FtpTransport {
     server: String,
-    login: Login,
+    /// Who it logs in as; nothing where it was given no one, which a server
+    /// that checks who logs in refuses.
+    login: Option<Login>,
     /// The secret its Location names, whose password the login presents,
     /// read at each login (ADR-0019, amendment 2026-10-29).
     secret: Option<transport::Secured>,
@@ -88,12 +95,13 @@ pub struct FtpTransport {
 }
 
 impl FtpTransport {
-    /// Speak to the server at `server`, anonymous unless [`Self::logging_in`].
+    /// Speak to the server at `server`, presenting nothing until
+    /// [`Self::logging_in`] or the secret its Location names.
     #[must_use]
     pub fn new(server: impl Into<String>) -> Self {
         Self {
             server: server.into(),
-            login: anonymous(),
+            login: None,
             secret: None,
             directory: None,
             timeout: None,
@@ -123,7 +131,7 @@ impl FtpTransport {
     /// Log in as this.
     #[must_use]
     pub fn logging_in(mut self, login: Login) -> Self {
-        self.login = login;
+        self.login = Some(login);
         self
     }
 
@@ -152,7 +160,15 @@ impl FtpTransport {
     /// Connect to `server` and log in, as FTPS where this transport speaks it,
     /// in the directory its address names where `server` is its own.
     fn connect_to(&self, server: &str) -> Result<Client> {
-        let login = &transport::secured::logged_in(&self.login, self.secret.as_ref(), "ftp")?;
+        let login = match (&self.login, &self.secret) {
+            (None, None) => None,
+            (login, secret) => Some(transport::secured::logged_in(
+                &login.clone().unwrap_or_default(),
+                secret.as_ref(),
+                "ftp",
+            )?),
+        };
+        let login = login.as_ref();
         #[cfg(feature = "tls")]
         let connected = match &self.secured {
             Some(secured) => Client::connect_secured(server, login, self.timeout, secured),
@@ -175,12 +191,13 @@ impl FtpTransport {
         socket::bind_tcp(&self.server)
     }
 
-    /// Accept one client on an already-bound listener.
+    /// Accept one client on an already-bound listener, its login admitted
+    /// where `check` admits it.
     ///
     /// # Errors
     /// Where the connection could not be accepted.
-    pub fn accept_one(&self, listener: &TcpListener) -> Result<Session> {
-        Session::accept(listener, self.timeout)
+    pub fn accept_one(&self, listener: &TcpListener, check: Check) -> Result<Session> {
+        Session::accept(listener, self.timeout, check)
     }
 
     /// Where a target names the server and file itself — `ftp://host/name`
@@ -289,7 +306,8 @@ impl Sited for FtpTransport {
 impl Configured for FtpTransport {
     /// The address is the server, the user and the directory,
     /// `ftp://user@host:21/dir`, or `host:21` alone: where a Location logs
-    /// in, as whom — anonymous where it names no one — and where it lists
+    /// in, as whom — no one where it names none, which a server that checks
+    /// who logs in refuses — and where it lists
     /// and stores. `ftps://` is FTPS: `AUTH TLS` on the control connection
     /// and `PROT P` on every transfer (RFC 4217).
     const SETTINGS: &'static Settings = &Settings {
@@ -415,11 +433,17 @@ mod tests {
         let built = FtpTransport::open("ftp://party@ftp.example:21/in", Applies::Receive, &given)
             .expect("built");
         assert_eq!(built.server, "ftp.example:21");
-        assert_eq!(built.login.user, "party");
+        assert_eq!(
+            built.login.as_ref().map(|login| login.user.as_str()),
+            Some("party")
+        );
         assert_eq!(built.directory.as_deref(), Some("in"));
         assert_eq!(built.timeout, Some(secs(30)));
         let plain = FtpTransport::open("ftp.example:21", Applies::Send, &[]).expect("plain");
-        assert_eq!(plain.login.user, "anonymous");
+        assert!(
+            plain.login.is_none(),
+            "no one, where the address names no one"
+        );
         assert_eq!(plain.directory, None);
         for gone in ["user", "tls", "delete_after_retrieve"] {
             let setting = [(gone.to_string(), Given::Text("x".to_string()))];
@@ -472,7 +496,9 @@ mod tests {
         let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let sender = std::thread::spawn(move || {
-            let near = FtpTransport::new(address.clone()).timing_out_after(secs(2));
+            let near = FtpTransport::new(address.clone())
+                .logging_in(crate::fixture::login())
+                .timing_out_after(secs(2));
             near.send("1.edi", b"UNA:+.? '")?;
             near.send(&format!("ftp://{address}/2.edi"), b"")?;
             let mut arrived = settled(&near)?;
@@ -484,7 +510,9 @@ mod tests {
         });
         // One server, so one control connection for both stores and the
         // receive that takes them back.
-        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let mut session = far_end
+            .accept_one(&listener, crate::fixture::check())
+            .expect("accepting");
         let first = session.next_store().expect("first").expect("one");
         assert_eq!(first.bytes, b"UNA:+.? '");
         assert!(first.origin_uri.ends_with("/1.edi"));
@@ -508,7 +536,9 @@ mod tests {
         let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
-            let near = FtpTransport::new(address).timing_out_after(secs(2));
+            let near = FtpTransport::new(address)
+                .logging_in(crate::fixture::login())
+                .timing_out_after(secs(2));
             let first = transport::arrived::one_arrival(settled(&near)?, "listed")?;
             assert!(first.defers());
             let (_, mut body, acknowledgement) = first.into_parts();
@@ -521,7 +551,7 @@ mod tests {
         });
         let files = std::collections::BTreeMap::from([("1.edi".to_string(), b"UNB".to_vec())]);
         let mut session = far_end
-            .accept_one(&listener)
+            .accept_one(&listener, crate::fixture::check())
             .expect("accepting")
             .with_files(files);
         let mut events = Vec::new();
@@ -550,7 +580,9 @@ mod tests {
         let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
-            let near = FtpTransport::new(address).timing_out_after(secs(2));
+            let near = FtpTransport::new(address)
+                .logging_in(crate::fixture::login())
+                .timing_out_after(secs(2));
             let first = transport::arrived::one_arrival(settled(&near)?, "listed")?;
             first.refused(transport::Refusal::Unacceptable)?;
             let unchanged = near.receive()?.len() + near.receive()?.len();
@@ -561,7 +593,7 @@ mod tests {
         });
         let files = std::collections::BTreeMap::from([("1.edi".to_string(), b"UNB".to_vec())]);
         let mut session = far_end
-            .accept_one(&listener)
+            .accept_one(&listener, crate::fixture::check())
             .expect("accepting")
             .with_files(files);
         let mut events = Vec::new();
@@ -589,7 +621,9 @@ mod tests {
         const SENDS: usize = 100;
         let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(5));
         let (listener, address) = far_end.bind().expect("binding");
-        let near = FtpTransport::new(address).timing_out_after(secs(5));
+        let near = FtpTransport::new(address)
+            .logging_in(crate::fixture::login())
+            .timing_out_after(secs(5));
         let sending = near.clone();
         let sender = std::thread::spawn(move || {
             for n in 0..SENDS {
@@ -598,13 +632,17 @@ mod tests {
             sending.send("last.edi", b"after the close")
         });
         // One USER and PASS for every store: one control connection.
-        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let mut session = far_end
+            .accept_one(&listener, crate::fixture::check())
+            .expect("accepting");
         for n in 0..SENDS {
             let stored = session.next_store().expect("store").expect("one");
             assert_eq!(stored.bytes, n.to_string().as_bytes());
         }
         drop(session);
-        let mut again = far_end.accept_one(&listener).expect("a new connection");
+        let mut again = far_end
+            .accept_one(&listener, crate::fixture::check())
+            .expect("a new connection");
         let last = again.next_store().expect("store").expect("one");
         assert_eq!(last.bytes, b"after the close");
         sender.join().expect("thread").expect("sending");
@@ -618,7 +656,9 @@ mod tests {
         const RECEIVES: usize = 100;
         let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(5));
         let (listener, address) = far_end.bind().expect("binding");
-        let near = FtpTransport::new(address).timing_out_after(secs(5));
+        let near = FtpTransport::new(address)
+            .logging_in(crate::fixture::login())
+            .timing_out_after(secs(5));
         let (go, going) = std::sync::mpsc::channel();
         let receiver = std::thread::spawn(move || {
             for _ in 0..RECEIVES {
@@ -629,12 +669,16 @@ mod tests {
             going.recv().expect("go");
             Ok::<_, transport::TransportError>((near.receive()?, near.controls.opened()))
         });
-        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let mut session = far_end
+            .accept_one(&listener, crate::fixture::check())
+            .expect("accepting");
         let marker = session.next_store().expect("served").expect("the store");
         assert_eq!(marker.bytes, b"listed");
         drop(session);
         go.send(()).expect("went");
-        let mut again = far_end.accept_one(&listener).expect("a new connection");
+        let mut again = far_end
+            .accept_one(&listener, crate::fixture::check())
+            .expect("a new connection");
         assert!(again.next_event().expect("served").is_none());
         let (arrived, opened) = receiver.join().expect("thread").expect("listed");
         assert!(arrived.is_empty());
@@ -705,7 +749,8 @@ mod tests {
             "{wrong}"
         );
 
-        kept.set("partner-x.ftp", xcore::SecretKind::Password, &Kept::drawn());
+        let drawn = Kept::drawn();
+        kept.set("partner-x.ftp", xcore::SecretKind::Password, &drawn);
         let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let secured = kept.secured("partner-x.ftp");
@@ -716,12 +761,56 @@ mod tests {
                 .secured_by(secured)?;
             transport::Transport::send(&near, "in.edi", b"UNA")
         });
-        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let mut session = far_end
+            .accept_one(&listener, net::login::only("party", drawn))
+            .expect("accepting");
         let stored = session.next_store().expect("stored").expect("one");
         assert_eq!(stored.bytes, b"UNA");
         sender
             .join()
             .expect("thread")
             .expect("logged in and stored");
+    }
+
+    /// Whether the server kept what `near` stored, and the error `near`
+    /// was refused with, if it was.
+    fn storing(near: FtpTransport) -> (bool, Option<transport::TransportError>) {
+        let far_end = FtpTransport::new("127.0.0.1:0").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = FtpTransport {
+            server: address,
+            ..near
+        };
+        let sender = std::thread::spawn(move || near.send("in.edi", b"UNA").err());
+        let mut session = far_end
+            .accept_one(&listener, crate::fixture::check())
+            .expect("accepting");
+        let stored = session.next_store().is_ok_and(|stored| stored.is_some());
+        (stored, sender.join().expect("thread"))
+    }
+
+    /// The error `near` was refused with, nothing stored.
+    fn refused(near: FtpTransport) -> transport::TransportError {
+        let (stored, refused) = storing(near);
+        assert!(!stored, "nothing is stored by a client not logged in");
+        refused.expect("refused")
+    }
+
+    #[test]
+    fn a_password_the_check_refuses_anonymous_ftp_and_no_login_are_all_refused() {
+        let wrong = Login::new(crate::fixture::USER, "guessed");
+        let wrong = refused(FtpTransport::new("").logging_in(wrong));
+        assert!(wrong.message.contains("530"), "{wrong}");
+        assert!(!wrong.retryable, "{wrong}");
+
+        let anonymous = Login::new("anonymous", crate::fixture::SECRET.as_str());
+        let anonymous = refused(FtpTransport::new("").logging_in(anonymous));
+        assert!(anonymous.message.contains("anonymous"), "{anonymous}");
+
+        let nothing = refused(FtpTransport::new(""));
+        assert!(nothing.message.contains("log in first"), "{nothing}");
+
+        let (stored, admitted) = storing(FtpTransport::new("").logging_in(crate::fixture::login()));
+        assert!(stored && admitted.is_none(), "{admitted:?}");
     }
 }

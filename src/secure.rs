@@ -205,9 +205,15 @@ pub(crate) mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bound");
         let store = crate::Store::default();
         let timeout = Some(Duration::from_secs(5));
-        let serving =
-            crate::serving(listener, store.clone(), timeout, Some(server)).expect("serving");
+        let serving = crate::serving(
+            listener,
+            store.clone(),
+            (timeout, crate::fixture::check()),
+            Some(server),
+        )
+        .expect("serving");
         let near = crate::FtpTransport::new(serving.address())
+            .logging_in(crate::fixture::login())
             .timing_out_after(Duration::from_secs(5))
             .secured(super::Secured::trusting(client).named("localhost"));
         near.send("order.edi", b"UNB+UNOC").expect("stored");

@@ -5,8 +5,10 @@
 //! (`transport::concurrent`); each client's session is this crate's.
 
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::Duration;
 
+use net::login::Check;
 use transport::concurrent::Concurrent;
 use transport::error::Result;
 
@@ -14,19 +16,20 @@ use crate::session::Session;
 use crate::store::Store;
 
 /// Serve every client `listener` accepts over `store`, each read given up
-/// after `timeout`; FTPS where `guard` is given. Dropped, it stops
-/// accepting, and the sessions end as their clients leave.
+/// after `timeout`, each login admitted where `check` admits it; FTPS
+/// where `guard` is given. Dropped, it stops accepting, and the sessions
+/// end as their clients leave.
 ///
 /// # Errors
 /// Where the listener's address could not be read.
 pub fn serving(
     listener: TcpListener,
     store: Store,
-    timeout: Option<Duration>,
+    (timeout, check): (Option<Duration>, Check),
     guard: Option<Guard>,
 ) -> Result<Concurrent> {
     Concurrent::start(listener, "ftp-session", move |stream| {
-        serve(stream, store.clone(), timeout, guard.as_ref());
+        serve(stream, store.clone(), (timeout, &check), guard.as_ref());
     })
 }
 
@@ -42,11 +45,16 @@ pub type Guard = std::sync::Arc<tls::ServerConfig>;
 pub enum Guard {}
 
 /// One client's session, to its end.
-fn serve(stream: TcpStream, store: Store, timeout: Option<Duration>, guard: Option<&Guard>) {
+fn serve(
+    stream: TcpStream,
+    store: Store,
+    (timeout, check): (Option<Duration>, &Check),
+    guard: Option<&Guard>,
+) {
     let Ok(peer) = stream.peer_addr() else {
         return;
     };
-    let Ok(session) = Session::serving(stream, peer, timeout) else {
+    let Ok(session) = Session::serving(stream, peer, timeout, Arc::clone(check)) else {
         return;
     };
     let mut session = session.sharing(store);
@@ -79,7 +87,13 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bound");
         let store = Store::default();
         let timeout = Some(Duration::from_secs(10));
-        let serving = serving(listener, store.clone(), timeout, guard).expect("serving");
+        let serving = serving(
+            listener,
+            store.clone(),
+            (timeout, crate::fixture::check()),
+            guard,
+        )
+        .expect("serving");
         (serving, store)
     }
 
@@ -117,9 +131,13 @@ mod tests {
 
     fn receivers(address: &str, built: impl Fn(FtpTransport) -> FtpTransport) -> [FtpTransport; 2] {
         [0, 1].map(|place| {
-            built(FtpTransport::new(address).timing_out_after(Duration::from_secs(10)))
-                .on_node(&node(place))
-                .expect("built on its node")
+            built(
+                FtpTransport::new(address)
+                    .logging_in(crate::fixture::login())
+                    .timing_out_after(Duration::from_secs(10)),
+            )
+            .on_node(&node(place))
+            .expect("built on its node")
         })
     }
 
