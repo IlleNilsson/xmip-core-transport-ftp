@@ -1,5 +1,5 @@
 //! The server's side of one control connection: what a Receive Location
-//! that accepts uploads directly runs, and what a test or the Playground
+//! that accepts uploads directly runs, and what a test or the Essentials
 //! puts at the far end.
 //!
 //! Not an FTP server. One session serves one client over a directory kept
@@ -12,7 +12,7 @@
 //! answers `AUTH TLS`, `PBSZ` and `PROT` (RFC 4217). A login is admitted
 //! only where the check the session is handed (`net::login::Check`) admits
 //! the user `USER` named and the password `PASS` gave — it links no
-//! authenticator; the Playground's check is `authenticate/password`'s — and
+//! authenticator; the Essentials' check is `authenticate/password`'s — and
 //! `anonymous` and `ftp` are refused before any check is asked. Until a
 //! login is admitted every command but `USER`, `PASS`, `AUTH`, `PBSZ`,
 //! `PROT`, `NOOP` and `QUIT` is answered 530. Until 2026-11-01 any

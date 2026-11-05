@@ -1,6 +1,6 @@
 //! A far end that serves every client a listener accepts at once, over one
 //! shared [`Store`], until it is let go: what several receiving nodes reach
-//! to race for the same files (the Playground's drop box; ADR-0028,
+//! to race for the same files (the Essentials' drop box; ADR-0028,
 //! amendment 2026-10-13). The accepting is the capability's
 //! (`transport::concurrent`); each client's session is this crate's.
 
