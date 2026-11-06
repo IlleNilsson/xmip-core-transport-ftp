@@ -23,7 +23,8 @@
 //! own server refuses such an `RNTO` (`session.rs`).
 
 use std::io::{self, Read};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use xcore::lock::Locked;
 
 use transport::claim::{ClaimSite, Listed, Restore, is_turn};
 use transport::error::{Result, TransportError, protocol_error};
@@ -57,7 +58,7 @@ impl Control {
     }
 
     fn line(&self) -> MutexGuard<'_, Line> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.locked()
     }
 
     /// Run `act` on the client when no transfer is running on it.

@@ -8,7 +8,8 @@
 //! `MDTM` and `MLSD` `modify`), which is the write that last stamped it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
+use xcore::lock::Locked;
 
 /// The files and directories; cloned, the same ones.
 #[derive(Clone, Default)]
@@ -45,7 +46,7 @@ impl Store {
     }
 
     fn held(&self) -> MutexGuard<'_, Held> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.locked()
     }
 
     /// The files, name to bytes.
