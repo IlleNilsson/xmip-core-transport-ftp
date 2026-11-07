@@ -169,13 +169,13 @@ impl FtpTransport {
             )?),
         };
         let login = login.as_ref();
-        #[cfg(feature = "tls")]
-        let connected = match &self.secured {
-            Some(secured) => Client::connect_secured(server, login, self.timeout, secured),
-            None => Client::connect(server, login, self.timeout),
+        let connected = cfg_select! {
+            feature = "tls" => match &self.secured {
+                Some(secured) => Client::connect_secured(server, login, self.timeout, secured),
+                None => Client::connect(server, login, self.timeout),
+            },
+            _ => Client::connect(server, login, self.timeout),
         };
-        #[cfg(not(feature = "tls"))]
-        let connected = Client::connect(server, login, self.timeout);
         let mut client = connected?;
         if let Some(directory) = self.directory.as_deref().filter(|_| server == self.server) {
             client.change_directory(directory)?;
@@ -381,33 +381,38 @@ impl Configured for FtpTransport {
 }
 
 impl FtpTransport {
-    /// FTPS where the address is `ftps://`, checked for `name` where one
-    /// is given.
-    #[cfg(feature = "tls")]
-    #[allow(clippy::unnecessary_wraps)]
-    fn guarded_as(self, tls: bool, name: Option<&str>) -> Result<Self> {
-        if !tls {
-            return Ok(self);
+    cfg_select! {
+        feature = "tls" => {
+            /// FTPS where the address is `ftps://`, checked for `name` where
+            /// one is given.
+            #[allow(clippy::unnecessary_wraps)]
+            fn guarded_as(self, tls: bool, name: Option<&str>) -> Result<Self> {
+                if !tls {
+                    return Ok(self);
+                }
+                let secured =
+                    name.map_or_else(Secured::native, |name| Secured::native().named(name));
+                Ok(self.secured(secured))
+            }
         }
-        let secured = name.map_or_else(Secured::native, |name| Secured::native().named(name));
-        Ok(self.secured(secured))
-    }
-
-    /// Plain FTP; `ftps://` refused, since this build carries no TLS.
-    #[cfg(not(feature = "tls"))]
-    fn guarded_as(self, tls: bool, _name: Option<&str>) -> Result<Self> {
-        if tls {
-            return Err(transport::TransportError::permanent(
-                "FTPS needs the ftp transport built with its tls feature",
-            ));
+        _ => {
+            /// Plain FTP; `ftps://` refused, since this build carries no TLS.
+            fn guarded_as(self, tls: bool, _name: Option<&str>) -> Result<Self> {
+                if tls {
+                    return Err(transport::TransportError::permanent(
+                        "FTPS needs the ftp transport built with its tls feature",
+                    ));
+                }
+                Ok(self)
+            }
         }
-        Ok(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use transport::loopback::Loopback;
     use transport::payload::edge_payloads;
 
@@ -564,12 +569,10 @@ mod tests {
             (&b"UNB"[..], &b"UNB"[..])
         );
         let claimed = |name: &String| name.starts_with("1.edi.xmip-claim.");
-        assert!(
-            matches!(
-                events.as_slice(),
-                [Event::Retrieved(a), Event::Retrieved(b), Event::Deleted(c)]
-                    if claimed(a) && claimed(b) && b == c
-            ),
+        assert_matches!(
+            events.as_slice(),
+            [Event::Retrieved(a), Event::Retrieved(b), Event::Deleted(c)]
+                if claimed(a) && claimed(b) && b == c,
             "the failed retrieve deleted nothing, each read claimed: {events:?}"
         );
         assert!(session.files().is_empty(), "deleted once accepted");
