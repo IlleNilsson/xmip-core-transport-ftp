@@ -33,16 +33,19 @@ pub fn serving(
     })
 }
 
-/// What a server presents for `AUTH TLS`; nothing without the `tls`
-/// feature.
-#[cfg(feature = "tls")]
-pub type Guard = std::sync::Arc<tls::ServerConfig>;
-
-/// What a server presents for `AUTH TLS`; nothing without the `tls`
-/// feature.
-#[cfg(not(feature = "tls"))]
-#[derive(Clone, Debug)]
-pub enum Guard {}
+cfg_select! {
+    feature = "tls" => {
+        /// What a server presents for `AUTH TLS`; nothing without the `tls`
+        /// feature.
+        pub type Guard = std::sync::Arc<tls::ServerConfig>;
+    }
+    _ => {
+        /// What a server presents for `AUTH TLS`; nothing without the `tls`
+        /// feature.
+        #[derive(Clone, Debug)]
+        pub enum Guard {}
+    }
+}
 
 /// One client's session, to its end.
 fn serve(
@@ -58,12 +61,16 @@ fn serve(
         return;
     };
     let mut session = session.sharing(store);
-    #[cfg(feature = "tls")]
-    if let Some(config) = guard {
-        session = session.guarding(std::sync::Arc::clone(config));
+    cfg_select! {
+        feature = "tls" => {
+            if let Some(config) = guard {
+                session = session.guarding(std::sync::Arc::clone(config));
+            }
+        }
+        _ => {
+            let _ = guard;
+        }
     }
-    #[cfg(not(feature = "tls"))]
-    let _ = guard;
     while let Ok(Some(_)) = session.next_event() {}
 }
 
