@@ -60,10 +60,7 @@ impl Secured {
     /// `socket`, a connection to `server`, guarded and its handshake begun.
     fn guard(&self, server: &str, socket: TcpStream) -> Result<tls::Guarded> {
         let name = self.name.as_deref().unwrap_or_else(|| host_of(server));
-        Ok(match &self.config {
-            Some(config) => tls::client_with(name, socket, Arc::clone(config))?,
-            None => tls::client(name, socket)?,
-        })
+        Ok(tls::client_trusting(name, socket, self.config.as_ref())?)
     }
 
     /// The control connection to `server`, turned over to TLS once the
