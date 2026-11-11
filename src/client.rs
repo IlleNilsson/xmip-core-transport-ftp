@@ -64,6 +64,7 @@ impl Client {
         timeout: Option<Duration>,
         secured: &Secured,
     ) -> Result<Self> {
+        let secured = secured.login()?;
         let stream = socket::connect_tcp(server, timeout)?;
         let mut plain = Self {
             line: Line::plain(stream)?,
