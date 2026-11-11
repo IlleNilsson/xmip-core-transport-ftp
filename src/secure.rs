@@ -4,9 +4,11 @@
 //! The client asks `AUTH TLS` in the clear; on `234` both ends hand the
 //! control connection to TLS in place (`xmip-core-library-tls`, ADR-0033),
 //! and the login follows guarded. `PBSZ 0` and `PROT P` then guard every
-//! data connection: each is its own TLS session over the same client
-//! configuration, so it resumes the control connection's session where the
-//! server keeps one — what a server that insists on session reuse checks.
+//! data connection: each is its own TLS session over the login's own
+//! client configuration ([`Secured::login`], `tls::login_trusting`), so it
+//! resumes the control connection's session where the server keeps one —
+//! what a server that insists on session reuse checks (vsftpd's
+//! `require_ssl_reuse`) — and no connection of another login does.
 //! A transfer ends with TLS's own close before the socket's, so a
 //! connection cut short is never read as a whole file.
 
@@ -55,6 +57,21 @@ impl Secured {
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
+    }
+
+    /// This guard for one login: the same name and trust, over a client
+    /// configuration of the login's own, so its data connections resume
+    /// its control connection's session and nothing else does. Built as
+    /// the login starts and dropped with it.
+    ///
+    /// # Errors
+    /// With no trust store given, where the operating system's is empty or
+    /// unreadable.
+    pub fn login(&self) -> Result<Self> {
+        Ok(Self {
+            name: self.name.clone(),
+            config: Some(tls::login_trusting(self.config.as_ref())?),
+        })
     }
 
     /// `socket`, a connection to `server`, guarded and its handshake begun.
@@ -189,6 +206,21 @@ pub(crate) mod tests {
         let anchors = held.anchors.as_deref().unwrap_or_default();
         let client = tls::trusting(anchors.as_bytes()).expect("a client configuration");
         (Arc::new(server), Arc::new(client))
+    }
+
+    #[test]
+    fn each_login_resumes_only_its_own_session() {
+        let (_, client) = certificate();
+        let secured = super::Secured::trusting(Arc::clone(&client)).named("localhost");
+        let first = secured.login().expect("a login");
+        let second = secured.login().expect("a login");
+        let config = |guard: &super::Secured| Arc::clone(guard.config.as_ref().expect("trust"));
+        assert!(!Arc::ptr_eq(&config(&first), &client), "not the shared one");
+        assert!(
+            !Arc::ptr_eq(&config(&first), &config(&second)),
+            "one a login"
+        );
+        assert_eq!(first.name.as_deref(), Some("localhost"));
     }
 
     #[test]
