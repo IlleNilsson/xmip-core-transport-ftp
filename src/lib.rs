@@ -53,8 +53,6 @@ pub use control::Control;
 use net::Target;
 use net::login::Check;
 pub use reply::Reply;
-#[cfg(feature = "tls")]
-pub use secure::Secured;
 pub use serving::{Guard, serving};
 pub use session::{Event, Session};
 pub use store::Store;
@@ -91,7 +89,7 @@ pub struct FtpTransport {
     claiming: Claiming<listing::Stamp>,
     /// FTPS, where given.
     #[cfg(feature = "tls")]
-    secured: Option<Secured>,
+    secured: Option<tls::ClientSettings>,
 }
 
 impl FtpTransport {
@@ -116,7 +114,7 @@ impl FtpTransport {
     /// every transfer, the server's certificate checked as `secured` says.
     #[cfg(feature = "tls")]
     #[must_use]
-    pub fn secured(mut self, secured: Secured) -> Self {
+    pub fn secured(mut self, secured: tls::ClientSettings) -> Self {
         self.secured = Some(secured);
         self
     }
@@ -390,8 +388,8 @@ impl FtpTransport {
                 if !tls {
                     return Ok(self);
                 }
-                let secured =
-                    name.map_or_else(Secured::native, |name| Secured::native().named(name));
+                let native = tls::ClientSettings::native();
+                let secured = name.map_or_else(|| native.clone(), |name| native.clone().named(name));
                 Ok(self.secured(secured))
             }
         }

@@ -5,7 +5,7 @@
 //! control connection to TLS in place (`xmip-core-library-tls`, ADR-0033),
 //! and the login follows guarded. `PBSZ 0` and `PROT P` then guard every
 //! data connection: each is its own TLS session over the login's own
-//! client configuration ([`Secured::login`], `tls::login_trusting`), so it
+//! client configuration (`tls::ClientSettings::login`), so it
 //! resumes the control connection's session where the server keeps one —
 //! what a server that insists on session reuse checks (vsftpd's
 //! `require_ssl_reuse`) — and no connection of another login does.
@@ -21,89 +21,40 @@ use transport::error::Result;
 
 use crate::wire::{DataStream, Line};
 
-/// How a client guards its connections: the trust store it checks the
-/// server's certificate against, and the name it checks it for.
-#[derive(Clone)]
-pub struct Secured {
-    /// The name the certificate must carry; the address's host where `None`.
-    name: Option<String>,
-    /// The trust a caller holds — a Party's own authority, a test's; the
-    /// operating system's store where `None`.
-    config: Option<Arc<tls::ClientConfig>>,
+/// `socket`, a connection to `server`, guarded as `settings` say — the
+/// estate's one pair of trust store and name (`tls::ClientSettings`) — and
+/// its handshake begun.
+fn guard(settings: &tls::ClientSettings, server: &str, socket: TcpStream) -> Result<tls::Guarded> {
+    Ok(settings.client(net::authority::host_of(server), socket)?)
 }
 
-impl Secured {
-    /// Checked against the operating system's trust store, for the
-    /// address's host.
-    #[must_use]
-    pub const fn native() -> Self {
-        Self {
-            name: None,
-            config: None,
-        }
-    }
+/// The control connection to `server`, turned over to TLS once the server
+/// agreed to `AUTH TLS`, its certificate checked as `settings` say — a
+/// login's own (`tls::ClientSettings::login`).
+///
+/// # Errors
+/// Where the handshake failed, the server's certificate among the reasons.
+pub fn control(settings: &tls::ClientSettings, server: &str, line: Line) -> Result<Line> {
+    let socket = line.socket;
+    let guarded = guard(settings, server, clone(&socket)?)?;
+    let halves = split(guarded)?;
+    Ok(Line {
+        reader: std::io::BufReader::new(Box::new(halves.reading)),
+        writer: Box::new(halves.writing),
+        socket,
+    })
+}
 
-    /// Checked against the trust `config` holds.
-    #[must_use]
-    pub fn trusting(config: Arc<tls::ClientConfig>) -> Self {
-        Self {
-            name: None,
-            config: Some(config),
-        }
-    }
-
-    /// Checked for `name` rather than the address's host.
-    #[must_use]
-    pub fn named(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
-        self
-    }
-
-    /// This guard for one login: the same name and trust, over a client
-    /// configuration of the login's own, so its data connections resume
-    /// its control connection's session and nothing else does. Built as
-    /// the login starts and dropped with it.
-    ///
-    /// # Errors
-    /// With no trust store given, where the operating system's is empty or
-    /// unreadable.
-    pub fn login(&self) -> Result<Self> {
-        Ok(Self {
-            name: self.name.clone(),
-            config: Some(tls::login_trusting(self.config.as_ref())?),
-        })
-    }
-
-    /// `socket`, a connection to `server`, guarded and its handshake begun.
-    fn guard(&self, server: &str, socket: TcpStream) -> Result<tls::Guarded> {
-        let name = self.name.as_deref().unwrap_or_else(|| host_of(server));
-        Ok(tls::client_trusting(name, socket, self.config.as_ref())?)
-    }
-
-    /// The control connection to `server`, turned over to TLS once the
-    /// server agreed to `AUTH TLS`.
-    ///
-    /// # Errors
-    /// Where the handshake failed, the server's certificate among the
-    /// reasons.
-    pub fn control(&self, server: &str, line: Line) -> Result<Line> {
-        let socket = line.socket;
-        let guarded = self.guard(server, clone(&socket)?)?;
-        let halves = split(guarded)?;
-        Ok(Line {
-            reader: std::io::BufReader::new(Box::new(halves.reading)),
-            writer: Box::new(halves.writing),
-            socket,
-        })
-    }
-
-    /// A data connection to `server`, guarded.
-    ///
-    /// # Errors
-    /// Where the handshake could not be started.
-    pub fn data(&self, server: &str, socket: TcpStream) -> Result<Box<dyn DataStream>> {
-        Ok(Box::new(self.guard(server, socket)?))
-    }
+/// A data connection to `server`, guarded as the login's `settings` say.
+///
+/// # Errors
+/// Where the handshake could not be started.
+pub fn data(
+    settings: &tls::ClientSettings,
+    server: &str,
+    socket: TcpStream,
+) -> Result<Box<dyn DataStream>> {
+    Ok(Box::new(guard(settings, server, socket)?))
 }
 
 /// The server's side of `AUTH TLS`: the control connection on `line`,
@@ -163,12 +114,6 @@ fn drained(stream: &mut impl io::Read, socket: &TcpStream) {
     }
 }
 
-/// The host of `server`, `host:port` or `[v6]:port`.
-fn host_of(server: &str) -> &str {
-    let host = server.rsplit_once(':').map_or(server, |(host, _)| host);
-    host.trim_start_matches('[').trim_end_matches(']')
-}
-
 fn clone(socket: &TcpStream) -> Result<TcpStream> {
     socket
         .try_clone()
@@ -209,21 +154,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn each_login_resumes_only_its_own_session() {
-        let (_, client) = certificate();
-        let secured = super::Secured::trusting(Arc::clone(&client)).named("localhost");
-        let first = secured.login().expect("a login");
-        let second = secured.login().expect("a login");
-        let config = |guard: &super::Secured| Arc::clone(guard.config.as_ref().expect("trust"));
-        assert!(!Arc::ptr_eq(&config(&first), &client), "not the shared one");
-        assert!(
-            !Arc::ptr_eq(&config(&first), &config(&second)),
-            "one a login"
-        );
-        assert_eq!(first.name.as_deref(), Some("localhost"));
-    }
-
-    #[test]
     fn a_store_and_a_retrieve_cross_ftps_whole() {
         use std::net::TcpListener;
         use std::time::Duration;
@@ -244,7 +174,7 @@ pub(crate) mod tests {
         let near = crate::FtpTransport::new(serving.address())
             .logging_in(crate::fixture::login())
             .timing_out_after(Duration::from_secs(5))
-            .secured(super::Secured::trusting(client).named("localhost"));
+            .secured(tls::ClientSettings::trusting(client).named("localhost"));
         near.send("order.edi", b"UNB+UNOC").expect("stored");
         assert!(near.receive().expect("found").is_empty());
         let taken = near

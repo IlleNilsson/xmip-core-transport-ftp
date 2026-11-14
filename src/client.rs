@@ -14,7 +14,7 @@ use transport::{Login, socket};
 use crate::listing::{self, Stamp};
 use crate::reply::{self, Reply};
 #[cfg(feature = "tls")]
-use crate::secure::Secured;
+use crate::secure;
 use crate::wire::{Data, Line};
 
 /// One logged-in control connection, kept between transfers while the
@@ -25,8 +25,9 @@ pub struct Client {
     timeout: Option<Duration>,
     /// Whether the server answers `MLSD`; asked once, by the first listing.
     listing: Option<bool>,
+    /// The login's own TLS settings, where it speaks FTPS.
     #[cfg(feature = "tls")]
-    secured: Option<Secured>,
+    secured: Option<tls::ClientSettings>,
 }
 
 impl Client {
@@ -62,7 +63,7 @@ impl Client {
         server: &str,
         login: Option<&Login>,
         timeout: Option<Duration>,
-        secured: &Secured,
+        secured: &tls::ClientSettings,
     ) -> Result<Self> {
         let secured = secured.login()?;
         let stream = socket::connect_tcp(server, timeout)?;
@@ -79,7 +80,7 @@ impl Client {
             return Err(refused("TLS", &auth));
         }
         let mut client = Self {
-            line: secured.control(server, plain.line)?,
+            line: secure::control(&secured, server, plain.line)?,
             ..plain
         };
         client.logged_in(login)?;
@@ -325,8 +326,8 @@ impl Client {
     #[allow(clippy::unnecessary_wraps)]
     fn guarded(&self, socket: std::net::TcpStream) -> Result<Data> {
         #[cfg(feature = "tls")]
-        if let Some(secured) = &self.secured {
-            return Ok(Data::over(secured.data(&self.server, socket)?));
+        if let Some(settings) = &self.secured {
+            return Ok(Data::over(secure::data(settings, &self.server, socket)?));
         }
         let _ = &self.server;
         Ok(Data::plain(socket))
