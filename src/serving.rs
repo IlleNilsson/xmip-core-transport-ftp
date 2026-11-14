@@ -217,7 +217,7 @@ mod tests {
         for file in 0..FILES {
             store.write(&format!("order-{file}.edi"), file.to_string().into_bytes());
         }
-        let secured = crate::Secured::trusting(client_config).named("localhost");
+        let secured = tls::ClientSettings::trusting(client_config).named("localhost");
         let receivers = receivers(serving.address(), |plain| plain.secured(secured.clone()));
         exactly_once(&race(&receivers, &store));
         // A send over FTPS lands whole.
