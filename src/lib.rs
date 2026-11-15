@@ -140,13 +140,6 @@ impl FtpTransport {
         self
     }
 
-    /// Give up on a peer that stops mid-transfer.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
     /// Connect and log in.
     ///
     /// # Errors
@@ -311,14 +304,12 @@ impl Configured for FtpTransport {
     const SETTINGS: &'static Settings = &Settings {
         technology: env!("CARGO_PKG_NAME"),
         settings: &[
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a server that stops mid-transfer is waited on; unbounded \
-                          when left out.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                None,
+                "How long a server that stops mid-transfer is waited on; unbounded \
+                 when left out.",
+            ),
             Setting {
                 name: "tls_name",
                 kind: Kind::Text,
@@ -335,6 +326,10 @@ impl Configured for FtpTransport {
     /// The whole address: its scheme says FTPS, its user part who logs in.
     fn own_terms(address: &str) -> &str {
         address
+    }
+
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
     }
 
     /// A named user's password is the secret the Location names, never a
@@ -356,9 +351,6 @@ impl Configured for FtpTransport {
             .filter(|path| !path.is_empty())
         {
             transport = transport.in_directory(directory);
-        }
-        if let Some(timeout) = settings.optional_duration("timeout") {
-            transport = transport.timing_out_after(timeout);
         }
         Ok(transport)
     }

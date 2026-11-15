@@ -9,7 +9,7 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::taken::Taken;
-use transport::{Login, Transport};
+use transport::{Configured, Login, Transport};
 
 use crate::FtpTransport;
 

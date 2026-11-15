@@ -126,6 +126,7 @@ pub(crate) mod tests {
 
     use provision::{Order, Purpose, Source};
     use provision_self_signed::{SETTINGS, SelfSigned, TECHNOLOGY};
+    use transport::Configured;
     use xcore::settings::Given;
 
     /// A server's configuration for `localhost`, signed by the estate's own
