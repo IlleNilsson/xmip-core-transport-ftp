@@ -11,8 +11,8 @@ A Receive Location lists, claims, retrieves and deletes on the same kept control
 A file is taken once it is finished, and by one node (ADR-0024, amendment 2026-10-13): several receiving nodes may poll one directory, and whichever claims a file has it. The claim is the file family's, written once in the transport capability (`transport::claim`), in FTP's words (`src/control.rs`):
 
 - A listing is `MLSD` (RFC 3659), its facts giving each entry's kind, size and modification time; a server that does not answer it is listed by `NLST`, each name stamped by `SIZE` and `MDTM`. A file is taken by the listing after the one that found its stamp unchanged — the stability check — so a file still being stored is left.
-- Its turn is `MKD <name>.xmip-claim`, which a server refuses where anything of that name exists, and inside it `MKD <name>.xmip-claim/<node>`, so a starting node finds the turns it left. The claim is `RNFR` and `RNTO` to `<name>.xmip-claim.<node location, percent-encoded>.<nanoseconds>`; the turn is removed with `RMD`.
-- A node built by the runtime (`Configured::on_node`) returns every claim its name still holds on the server, and removes its turns, at its first receive that reaches the server, so a server out of reach never stops a node starting, and a Send Location never connects for it.
+- Its turn is `MKD <name>.xmip-claim`, which a server refuses where anything of that name exists, and inside it `MKD <name>.xmip-claim/<node and start>`, so a starting node finds the turns its earlier starts left. The claim is `RNFR` and `RNTO` to `<name>.xmip-claim.<node location, percent-encoded>~<start>.<nanoseconds>`; the turn is removed with `RMD`.
+- A node built by the runtime (`Configured::on_node`) returns every claim its earlier starts still hold on the server, and removes their turns, at its first receive that reaches the server, never what its own start holds through another Location (ADR-0024, amendment 2026-11-22), so a server out of reach never stops a node starting, and a Send Location never connects for it.
 
 ## Acknowledgement
 

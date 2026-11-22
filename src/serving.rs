@@ -78,16 +78,18 @@ fn serve(
 mod tests {
     use std::collections::BTreeSet;
 
-    use transport::{Configured, NodeLocation, Transport};
+    use transport::{Configured, NodeLocation, NodeStart, Transport};
 
     use super::*;
     use crate::FtpTransport;
 
     const FILES: usize = 60;
 
-    /// A node location for the node at `place`; it names no node.
-    fn node(place: usize) -> NodeLocation {
-        NodeLocation::new(format!("process-{}/place-{place}", std::process::id()))
+    /// A start of the node at `place`, after every start before it; its
+    /// location names no node.
+    fn node(place: usize) -> NodeStart {
+        let location = format!("process-{}/place-{place}", std::process::id());
+        NodeStart::next(NodeLocation::new(location))
     }
 
     fn server(guard: Option<Guard>) -> (Concurrent, Store) {
