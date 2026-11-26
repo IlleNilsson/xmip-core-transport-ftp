@@ -13,14 +13,15 @@ path = "src/lib.rs"
 [dependencies]
 # A Technology depends on its parent Capability, never the reverse
 # (repository-model.md). Standard library otherwise: FTP is a reply code
-# and a line.
+# and a line. Its declaration takes the capability's `timeout`
+# (`transport::configured::timeout`).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
 # The reply code and the line it opens (`net::reply`, `net::read`), a
 # data connection read to its end under `net::MAX_BODY`, and the login a
 # session is offered with the check it is handed (`net::login`).
-net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
+net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main", optional = true }
 # The password the loopback mints for its one login (`codec::random`).
-codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
+codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main", optional = true }
 # The settings this technology declares (xcore::settings), read through
 # transport::Configured (ADR-0064, amendment 2026-09-26).
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
@@ -30,8 +31,17 @@ xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core
 tls = { package = "xmip-core-library-tls", git = "https://github.com/IlleNilsson/xmip-core-library-tls", branch = "main", optional = true }
 
 [features]
-# FTPS: AUTH TLS on the control connection, PROT P on every transfer.
-tls = ["dep:tls", "transport/tls"]
+# The technology: its code, everything it is built on, and its declaration.
+# Without it the crate is its declaration alone (ADR-0064, amendments
+# 2026-10-22 and 2026-11-26).
+default = ["declaration", "dep:net", "dep:codec"]
+# The declaration alone: what a Location of this technology is configured
+# with, `declaration::SETTINGS` and `SCHEMES`, and none of
+# the code — what the surfaces' library is to carry (open problem 48).
+declaration = []
+# FTPS: AUTH TLS on the control connection, PROT P on every transfer; the
+# technology's code, so the default with it.
+tls = ["default", "dep:tls", "transport/tls"]
 
 [dev-dependencies]
 # The loopback payloads the tests drive, from the capability's test

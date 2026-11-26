@@ -30,44 +30,75 @@
 //! back under its dropped name, never over a file dropped there since.
 //!
 //! The origin URI carries what the server knew: `ftp://server/orders/1.edi`.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod client;
+#[cfg(feature = "default")]
 pub mod control;
+#[cfg(feature = "declaration")]
+pub mod declaration;
 #[cfg(test)]
 mod fixture;
+#[cfg(feature = "default")]
 pub mod listing;
+#[cfg(feature = "default")]
 mod loopback;
+#[cfg(feature = "default")]
 pub mod reply;
 #[cfg(feature = "tls")]
 pub mod secure;
+#[cfg(feature = "default")]
 pub mod serving;
+#[cfg(feature = "default")]
 pub mod session;
+#[cfg(feature = "default")]
 pub mod store;
+#[cfg(feature = "default")]
 pub mod wire;
 
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
+#[cfg(feature = "default")]
 pub use client::Client;
+#[cfg(feature = "default")]
 pub use control::Control;
-use net::Target;
-use net::login::Check;
+#[cfg(feature = "default")]
+use net::{Target, login::Check};
+#[cfg(feature = "default")]
 pub use reply::Reply;
+#[cfg(feature = "default")]
 pub use serving::{Guard, serving};
+#[cfg(feature = "default")]
 pub use session::{Event, Session};
+#[cfg(feature = "default")]
 pub use store::Store;
+#[cfg(feature = "default")]
 use transport::claim::{Claimant, Claiming, Held, Site, Sited};
+#[cfg(feature = "default")]
 use transport::error::Result;
+#[cfg(feature = "default")]
 use transport::socket;
+#[cfg(feature = "default")]
 use transport::{
     Arrived, Configured, Directions, Login, NodeStart, Pool, ResourceClaim, Transport,
 };
-use xcore::settings::{Applies, Kind, Presence, Setting, Settings};
+#[cfg(feature = "default")]
+use xcore::settings::Settings;
 
 /// The control port an address that names none is reached on, FTPS as FTP
 /// (RFC 959, RFC 4217).
+#[cfg(feature = "default")]
 pub const PORT: u16 = 21;
 
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct FtpTransport {
     server: String,
@@ -92,6 +123,7 @@ pub struct FtpTransport {
     secured: Option<tls::ClientSettings>,
 }
 
+#[cfg(feature = "default")]
 impl FtpTransport {
     /// Speak to the server at `server`, presenting nothing until
     /// [`Self::logging_in`] or the secret its Location names.
@@ -201,6 +233,7 @@ impl FtpTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for FtpTransport {
     fn name(&self) -> &'static str {
         "ftp"
@@ -275,6 +308,7 @@ impl Transport for FtpTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Sited for FtpTransport {
     type Stamp = listing::Stamp;
 
@@ -294,34 +328,10 @@ impl Sited for FtpTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Configured for FtpTransport {
-    /// The address is the server, the user and the directory,
-    /// `ftp://user@host:21/dir`, or `host:21` alone: where a Location logs
-    /// in, as whom — no one where it names none, which a server that checks
-    /// who logs in refuses — and where it lists
-    /// and stores. `ftps://` is FTPS: `AUTH TLS` on the control connection
-    /// and `PROT P` on every transfer (RFC 4217).
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            transport::configured::timeout(
-                Applies::Both,
-                None,
-                "How long a server that stops mid-transfer is waited on; unbounded \
-                 when left out.",
-            ),
-            Setting {
-                name: "tls_name",
-                kind: Kind::Text,
-                presence: Presence::Optional,
-                meaning: "The name an ftps:// server's certificate is checked for; the \
-                          address's host when left out.",
-                applies: Applies::Both,
-            },
-        ],
-    };
-
-    const SCHEMES: &'static [&'static str] = &["ftp", "ftps"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     /// The whole address: its scheme says FTPS, its user part who logs in.
     fn own_terms(address: &str) -> &str {
@@ -372,6 +382,7 @@ impl Configured for FtpTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl FtpTransport {
     cfg_select! {
         feature = "tls" => {
@@ -407,6 +418,7 @@ mod tests {
     use std::assert_matches;
     use transport::loopback::Loopback;
     use transport::payload::edge_payloads;
+    use xcore::settings::Applies;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
