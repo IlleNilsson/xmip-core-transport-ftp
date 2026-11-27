@@ -1,11 +1,11 @@
 [package]
 name = "xmip-core-transport-ftp"
-version = "0.1.0"
-edition = "2024"
-license = "AGPL-3.0-or-later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 repository = "https://github.com/IlleNilsson/xmip-core-transport-ftp"
 description = "FTP transport: one file is one Stream, its name beside it; a Location lists and retrieves, or stores, in passive binary mode, or accepts clients directly. RFC 959. A xmip-core-transport technology."
-publish = false
+publish.workspace = true
 
 [lib]
 path = "src/lib.rs"
@@ -49,13 +49,5 @@ transport = { package = "xmip-core-transport", git = "https://github.com/IlleNil
 provision = { package = "xmip-core-provision", git = "https://github.com/IlleNilsson/xmip-core-provision", branch = "main" }
 provision_self_signed = { package = "xmip-core-provision-self-signed", git = "https://github.com/IlleNilsson/xmip-core-provision-self-signed", branch = "main" }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-too_many_lines = "warn"
-pedantic = { level = "warn", priority = -1 }
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-unwrap_used = "warn"
-expect_used = "allow"
+[lints]
+workspace = true
